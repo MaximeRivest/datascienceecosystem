@@ -1,0 +1,793 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MVT 3c - Zero-Copy Rust over Shared Wasm-Memory Shard Bank</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #121a33;
+      --panel-2: #0f1730;
+      --text: #e7ecff;
+      --muted: #a6b0d5;
+      --good: #66e3a4;
+      --warn: #ffd166;
+      --bad: #ff7b7b;
+      --border: #26345f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #0a0f1d, #0b1020 40%, #0d1327);
+      color: var(--text);
+    }
+    .wrap {
+      max-width: 1220px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { margin: 8px 0; color: var(--muted); }
+    textarea, input, button {
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+    }
+    textarea { width: 100%; min-height: 110px; resize: vertical; }
+    button {
+      border: 0;
+      background: linear-gradient(180deg, #1c6fff, #1758cc);
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .secondary { background: #1a2447; border: 1px solid var(--border); }
+    .danger { background: linear-gradient(180deg, #c14444, #9e2f2f); }
+    .card {
+      background: rgba(18, 26, 51, 0.9);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      margin-top: 18px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.22);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    .status {
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #101833;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
+    .status.good { border-color: rgba(102, 227, 164, 0.35); color: var(--good); }
+    .status.warn { border-color: rgba(255, 209, 102, 0.35); color: var(--warn); }
+    .status.bad { border-color: rgba(255, 123, 123, 0.35); color: var(--bad); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .metric {
+      background: #0e1630;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .metric .label {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .metric .value {
+      margin-top: 8px;
+      font-size: 22px;
+      font-weight: 800;
+    }
+    pre {
+      margin: 0;
+      background: #0b1228;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+      max-height: 360px;
+      color: #cfe0ff;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .small { font-size: 12px; color: var(--muted); }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    #fileInput { display: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>MVT 3c: Zero-Copy Rust over a Shared Wasm-Memory Shard Bank</h1>
+    <p>
+      This prototype upgrades the shard bank from plain <code>SharedArrayBuffer</code> shards to shared
+      <code>WebAssembly.Memory</code> shards. DuckDB-Wasm query results are routed into that bank as Arrow IPC bytes,
+      then 4 Rust/Wasm workers read those bytes <em>directly in place</em> from the imported shard memories without a copy.
+    </p>
+
+    <div id="isolationStatus" class="status warn">Checking browser requirements...</div>
+    <div id="duckdbStatus" class="status warn">DuckDB-Wasm not initialized yet.</div>
+    <div id="rustStatus" class="status warn">Rust zero-copy module not loaded yet.</div>
+    <div id="fileStatus" class="status warn">No Parquet file selected yet.</div>
+    <div id="proofStatus" class="status warn">Zero-copy Rust proof not started yet.</div>
+
+    <div class="card">
+      <strong>Setup</strong>
+      <div class="grid">
+        <label>
+          Shard size (MiB)
+          <input id="shardMiB" type="number" min="16" step="16" value="256" />
+        </label>
+        <label>
+          Target memory bank (GiB)
+          <input id="targetGiB" type="number" min="1" step="1" value="12" />
+        </label>
+        <label>
+          Rust worker count
+          <input id="workerCount" type="number" min="1" max="32" step="1" value="4" />
+        </label>
+        <label>
+          Max routed batches (0 = no limit)
+          <input id="maxBatches" type="number" min="0" step="1" value="0" />
+        </label>
+        <label>
+          Safety release shards on allocation failure
+          <input id="safetyRelease" type="number" min="0" step="1" value="2" />
+        </label>
+      </div>
+
+      <div class="row">
+        <button id="initDuckdbBtn">1. Init DuckDB-Wasm</button>
+        <button id="initRustBtn">2. Load Rust module</button>
+        <button id="pickFileBtn">3. Pick local .parquet</button>
+        <button id="allocateBtn">4. Allocate 12 GiB wasm bank</button>
+        <button id="routeBtn">5. Route Arrow bytes into bank</button>
+        <button id="proveBtn" class="secondary" disabled>6. Prove zero-copy Rust reads</button>
+        <button id="releaseBtn" class="danger">Release memory</button>
+      </div>
+
+      <input id="fileInput" type="file" accept=".parquet,application/octet-stream" />
+
+      <p class="small">
+        Default query projects only the analytic columns. That keeps the routed Arrow payload realistic while still letting the full 6 GiB Parquet file participate in the scan.
+      </p>
+    </div>
+
+    <div class="card">
+      <strong>Query used for routing</strong>
+      <textarea id="sqlInput">SELECT partition, feature_a, feature_b, feature_c, label FROM parquet_scan('selected.parquet');</textarea>
+      <p class="small">
+        This page proves <strong>zero-copy Rust access to routed Arrow IPC bytes</strong> from the shard bank. Full Rust Arrow-crate parsing can be layered on top next.
+      </p>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="label">Allocated shards</div><div id="shardCountValue" class="value">0</div></div>
+      <div class="metric"><div class="label">Bank size</div><div id="bankSizeValue" class="value">0 B</div></div>
+      <div class="metric"><div class="label">Free space</div><div id="freeSpaceValue" class="value">0 B</div></div>
+      <div class="metric"><div class="label">Batches routed</div><div id="batchCountValue" class="value">0</div></div>
+      <div class="metric"><div class="label">Rows routed</div><div id="rowCountValue" class="value">0</div></div>
+      <div class="metric"><div class="label">Arrow bytes routed</div><div id="byteCountValue" class="value">0 B</div></div>
+      <div class="metric"><div class="label">JS checksum</div><div id="jsChecksumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Rust checksum</div><div id="rustChecksumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Route time</div><div id="routeTimeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Rust proof time</div><div id="proofTimeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Workers completed</div><div id="workersDoneValue" class="value">0</div></div>
+      <div class="metric"><div class="label">Chrome heap used*</div><div id="heapValue" class="value">-</div></div>
+    </div>
+
+    <div class="card">
+      <strong>Result</strong>
+      <pre id="resultSummary"></pre>
+      <p class="small">
+        Success means the Rust checksum exactly matches the JavaScript checksum over the routed Arrow bytes, proving the Rust/Wasm workers read the bytes directly from the shared Wasm-memory shard bank.
+      </p>
+    </div>
+
+    <div class="card">
+      <strong>Log</strong>
+      <pre id="log"></pre>
+      <p class="small">
+        * Use Chrome Task Manager while the bank is allocated to confirm the tab really holds roughly 12 GiB.
+      </p>
+    </div>
+  </div>
+
+  <script type="module">
+    const DUCKDB_CDN = 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@latest/+esm';
+    const ARROW_CDN = 'https://cdn.jsdelivr.net/npm/apache-arrow@latest/+esm';
+    const RUST_WASM_URL = './wasm/checksum_range.wasm';
+
+    const $ = (id) => document.getElementById(id);
+    const logEl = $('log');
+    const resultSummaryEl = $('resultSummary');
+    const isolationStatusEl = $('isolationStatus');
+    const duckdbStatusEl = $('duckdbStatus');
+    const rustStatusEl = $('rustStatus');
+    const fileStatusEl = $('fileStatus');
+    const proofStatusEl = $('proofStatus');
+
+    const initDuckdbBtn = $('initDuckdbBtn');
+    const initRustBtn = $('initRustBtn');
+    const pickFileBtn = $('pickFileBtn');
+    const allocateBtn = $('allocateBtn');
+    const routeBtn = $('routeBtn');
+    const proveBtn = $('proveBtn');
+    const releaseBtn = $('releaseBtn');
+    const fileInput = $('fileInput');
+
+    const shardMiBInput = $('shardMiB');
+    const targetGiBInput = $('targetGiB');
+    const workerCountInput = $('workerCount');
+    const maxBatchesInput = $('maxBatches');
+    const safetyReleaseInput = $('safetyRelease');
+    const sqlInput = $('sqlInput');
+
+    let duckdb = null;
+    let arrow = null;
+    let db = null;
+    let conn = null;
+    let rustWasmBytes = null;
+    let selectedFile = null;
+    let selectedHandle = null;
+    let registeredFileName = 'selected.parquet';
+    let memories = [];
+    let router = null;
+    let lastRouteElapsedMs = 0;
+    let lastProofElapsedMs = 0;
+    let lastRustChecksum = null;
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      logEl.textContent += `[${time}] ${message}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes)) return '-';
+      const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+      let value = bytes;
+      let unitIndex = 0;
+      while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex++;
+      }
+      return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[unitIndex]}`;
+    }
+
+    function formatNumber(value, digits = 0) {
+      if (!Number.isFinite(value)) return '-';
+      return new Intl.NumberFormat(undefined, {
+        minimumFractionDigits: digits,
+        maximumFractionDigits: digits,
+      }).format(value);
+    }
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function updateHeapMetric() {
+      if (performance.memory && Number.isFinite(performance.memory.usedJSHeapSize)) {
+        $('heapValue').textContent = formatBytes(performance.memory.usedJSHeapSize);
+      } else {
+        $('heapValue').textContent = 'n/a';
+      }
+    }
+
+    function updateIsolationStatus() {
+      if (window.crossOriginIsolated) {
+        isolationStatusEl.className = 'status good';
+        isolationStatusEl.textContent = 'crossOriginIsolated = true. SharedArrayBuffer / shared WebAssembly.Memory are available.';
+      } else {
+        isolationStatusEl.className = 'status bad';
+        isolationStatusEl.textContent = [
+          'crossOriginIsolated = false. This page requires SharedArrayBuffer + shared WebAssembly.Memory.',
+          'Serve with:',
+          'Cross-Origin-Opener-Policy: same-origin',
+          'Cross-Origin-Embedder-Policy: require-corp'
+        ].join('\n');
+      }
+    }
+
+    class WasmMemoryRouter {
+      constructor(memories) {
+        this.memories = memories;
+        this.cursorShard = 0;
+        this.cursorOffset = 0;
+        this.entries = [];
+        this.totalRoutedBytes = 0;
+        this.totalRows = 0;
+        this.jsChecksum = 0;
+      }
+
+      get totalCapacityBytes() {
+        return this.memories.reduce((sum, memory) => sum + memory.buffer.byteLength, 0);
+      }
+
+      get freeBytes() {
+        return this.totalCapacityBytes - this.totalRoutedBytes;
+      }
+
+      writeBytes(bytes, rowCount) {
+        if (bytes.byteLength > this.freeBytes) {
+          throw new Error(`Bank full: need ${formatBytes(bytes.byteLength)} but only ${formatBytes(this.freeBytes)} remain.`);
+        }
+
+        const placements = [];
+        let remaining = bytes.byteLength;
+        let sourceOffset = 0;
+
+        while (remaining > 0) {
+          if (this.cursorShard >= this.memories.length) {
+            throw new Error('Shard router exhausted all wasm-memory shards.');
+          }
+          const buffer = this.memories[this.cursorShard].buffer;
+          const shardSpace = buffer.byteLength - this.cursorOffset;
+          if (shardSpace <= 0) {
+            this.cursorShard++;
+            this.cursorOffset = 0;
+            continue;
+          }
+
+          const writeLength = Math.min(shardSpace, remaining);
+          const slice = bytes.subarray(sourceOffset, sourceOffset + writeLength);
+          const destination = new Uint8Array(buffer, this.cursorOffset, writeLength);
+          destination.set(slice);
+          for (let i = 0; i < slice.length; i++) {
+            this.jsChecksum += slice[i];
+          }
+          placements.push({ shardIndex: this.cursorShard, offset: this.cursorOffset, length: writeLength });
+          this.cursorOffset += writeLength;
+          sourceOffset += writeLength;
+          remaining -= writeLength;
+          this.totalRoutedBytes += writeLength;
+        }
+
+        const entry = {
+          id: this.entries.length,
+          byteLength: bytes.byteLength,
+          rowCount,
+          placements,
+        };
+        this.entries.push(entry);
+        this.totalRows += rowCount;
+        return entry;
+      }
+    }
+
+    function renderResults() {
+      if (!router && lastRustChecksum == null) {
+        resultSummaryEl.textContent = 'No result yet.';
+        return;
+      }
+      const result = {
+        routedRows: router ? router.totalRows : 0,
+        routedBatches: router ? router.entries.length : 0,
+        routedArrowBytes: router ? router.totalRoutedBytes : 0,
+        jsChecksum: router ? router.jsChecksum : null,
+        rustChecksum: lastRustChecksum,
+        checksumMatch: router && lastRustChecksum != null ? router.jsChecksum === lastRustChecksum : null,
+      };
+      resultSummaryEl.textContent = JSON.stringify(result, null, 2);
+    }
+
+    function updateMetrics(workersDone = null) {
+      $('shardCountValue').textContent = formatNumber(memories.length);
+      $('bankSizeValue').textContent = formatBytes(router ? router.totalCapacityBytes : memories.reduce((sum, m) => sum + m.buffer.byteLength, 0));
+      $('freeSpaceValue').textContent = formatBytes(router ? router.freeBytes : memories.reduce((sum, m) => sum + m.buffer.byteLength, 0));
+      $('batchCountValue').textContent = formatNumber(router ? router.entries.length : 0);
+      $('rowCountValue').textContent = formatNumber(router ? router.totalRows : 0);
+      $('byteCountValue').textContent = formatBytes(router ? router.totalRoutedBytes : 0);
+      $('jsChecksumValue').textContent = router ? formatNumber(router.jsChecksum) : '-';
+      $('rustChecksumValue').textContent = lastRustChecksum != null ? formatNumber(lastRustChecksum) : '-';
+      $('routeTimeValue').textContent = lastRouteElapsedMs ? `${(lastRouteElapsedMs / 1000).toFixed(1)} s` : '-';
+      $('proofTimeValue').textContent = lastProofElapsedMs ? `${(lastProofElapsedMs / 1000).toFixed(1)} s` : '-';
+      if (workersDone !== null) $('workersDoneValue').textContent = formatNumber(workersDone);
+      updateHeapMetric();
+      renderResults();
+    }
+
+    async function initDuckDB() {
+      if (db && conn) {
+        duckdbStatusEl.className = 'status good';
+        duckdbStatusEl.textContent = 'DuckDB-Wasm already initialized.';
+        return;
+      }
+      duckdbStatusEl.className = 'status warn';
+      duckdbStatusEl.textContent = 'Loading DuckDB-Wasm and Apache Arrow modules...';
+      log('Importing DuckDB-Wasm and Apache Arrow from CDN...');
+      duckdb = await import(DUCKDB_CDN);
+      arrow = await import(ARROW_CDN);
+      const bundles = duckdb.getJsDelivrBundles();
+      const bundle = await duckdb.selectBundle(bundles);
+      const worker = await duckdb.createWorker(bundle.mainWorker);
+      db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(), worker);
+      await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+      conn = await db.connect();
+      duckdbStatusEl.className = 'status good';
+      duckdbStatusEl.textContent = 'DuckDB-Wasm initialized and ready.';
+      log('DuckDB-Wasm initialized successfully.');
+    }
+
+    async function initRustModule() {
+      rustStatusEl.className = 'status warn';
+      rustStatusEl.textContent = 'Loading Rust zero-copy module...';
+      const response = await fetch(RUST_WASM_URL);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch ${RUST_WASM_URL}: ${response.status}`);
+      }
+      rustWasmBytes = await response.arrayBuffer();
+      rustStatusEl.className = 'status good';
+      rustStatusEl.textContent = 'Rust zero-copy checksum module loaded.';
+      log('Rust zero-copy checksum module loaded.');
+    }
+
+    async function pickParquetFile() {
+      if (!db) await initDuckDB();
+      selectedFile = null;
+      selectedHandle = null;
+
+      if (window.showOpenFilePicker) {
+        const [handle] = await window.showOpenFilePicker({
+          multiple: false,
+          types: [{
+            description: 'Parquet files',
+            accept: {
+              'application/octet-stream': ['.parquet'],
+              'application/x-parquet': ['.parquet']
+            }
+          }]
+        });
+        if (!handle) return;
+        selectedHandle = handle;
+        selectedFile = await handle.getFile();
+      } else {
+        fileInput.value = '';
+        fileInput.click();
+        await new Promise((resolve, reject) => {
+          fileInput.onchange = () => fileInput.files?.[0] ? resolve() : reject(new Error('No file selected'));
+        });
+        selectedFile = fileInput.files[0];
+      }
+
+      if (!selectedFile) throw new Error('No file selected.');
+      try { await db.dropFile?.(registeredFileName); } catch {}
+
+      try {
+        await db.registerFileHandle(registeredFileName, selectedFile, duckdb.DuckDBDataProtocol.BROWSER_FILEREADER, true);
+        log(`Registered ${selectedFile.name} via FileReader-backed file handle.`);
+      } catch (error) {
+        if (selectedHandle && duckdb.DuckDBDataProtocol?.BROWSER_FSACCESS !== undefined) {
+          log(`FileReader registration failed (${error.message}). Trying File System Access handle fallback...`);
+          await db.registerFileHandle(registeredFileName, selectedHandle, duckdb.DuckDBDataProtocol.BROWSER_FSACCESS, true);
+          log(`Registered ${selectedFile.name} via File System Access handle fallback.`);
+        } else {
+          throw error;
+        }
+      }
+
+      fileStatusEl.className = 'status good';
+      fileStatusEl.textContent = `Selected file: ${selectedFile.name} (${formatBytes(selectedFile.size)}). Registered as ${registeredFileName}.`;
+    }
+
+    async function allocateWasmBank() {
+      if (!window.crossOriginIsolated) throw new Error('Shared WebAssembly.Memory unavailable.');
+      const shardMiB = Number(shardMiBInput.value);
+      const targetGiB = Number(targetGiBInput.value);
+      const safetyRelease = Math.trunc(Number(safetyReleaseInput.value));
+      if (!Number.isFinite(shardMiB) || shardMiB <= 0) throw new Error('Invalid shard size.');
+      if (!Number.isFinite(targetGiB) || targetGiB <= 0) throw new Error('Invalid target bank size.');
+
+      const shardBytes = shardMiB * 1024 * 1024;
+      const targetBytes = targetGiB * 1024 * 1024 * 1024;
+      if (shardBytes % 65536 !== 0) throw new Error('Shard size must align to 64 KiB wasm pages.');
+      const pages = shardBytes / 65536;
+
+      memories = [];
+      router = null;
+      lastRouteElapsedMs = 0;
+      lastProofElapsedMs = 0;
+      lastRustChecksum = null;
+      proveBtn.disabled = true;
+      updateMetrics(0);
+      proofStatusEl.className = 'status warn';
+      proofStatusEl.textContent = 'Zero-copy Rust proof not started yet.';
+      log(`Allocating shared WebAssembly.Memory bank: ${targetGiB} GiB target with ${shardMiB} MiB shards...`);
+
+      while (memories.reduce((sum, m) => sum + m.buffer.byteLength, 0) < targetBytes) {
+        try {
+          const memory = new WebAssembly.Memory({ shared: true, initial: pages, maximum: pages });
+          const touch = new Uint8Array(memory.buffer);
+          for (let i = 0; i < touch.length; i += 4096) touch[i] = (touch[i] + 1) & 0xff;
+          if (touch.length) touch[touch.length - 1] = (touch[touch.length - 1] + 1) & 0xff;
+          memories.push(memory);
+          if (memories.length % 4 === 0) updateMetrics(0);
+          await sleep(20);
+        } catch (error) {
+          log(`Allocation failed after ${memories.length} shard(s): ${error.message}`);
+          if (safetyRelease > 0) {
+            const count = Math.min(safetyRelease, memories.length);
+            for (let i = 0; i < count; i++) memories.pop();
+            log(`Safety release removed ${count} shard(s).`);
+          }
+          throw error;
+        }
+      }
+
+      router = new WasmMemoryRouter(memories);
+      updateMetrics(0);
+      log(`Shared WebAssembly.Memory bank ready: ${formatBytes(router.totalCapacityBytes)} across ${memories.length} shard(s).`);
+    }
+
+    function batchToColumnArrays(batch) {
+      const columns = {};
+      for (let index = 0; index < batch.schema.fields.length; index++) {
+        const field = batch.schema.fields[index];
+        const vector = typeof batch.getChildAt === 'function'
+          ? batch.getChildAt(index)
+          : typeof batch.getChild === 'function'
+            ? batch.getChild(field.name)
+            : null;
+        if (!vector) throw new Error(`Unable to access column vector for ${field.name}`);
+        if (typeof vector.toArray === 'function') {
+          columns[field.name] = vector.toArray();
+        } else {
+          const values = new Array(batch.numRows);
+          for (let row = 0; row < batch.numRows; row++) values[row] = vector.get(row);
+          columns[field.name] = values;
+        }
+      }
+      return columns;
+    }
+
+    function recordBatchToIPCBytes(batch) {
+      const table = arrow.tableFromArrays(batchToColumnArrays(batch));
+      return arrow.tableToIPC(table, 'stream');
+    }
+
+    async function routeQueryIntoBank() {
+      if (!conn) throw new Error('DuckDB-Wasm is not initialized.');
+      if (!selectedFile) throw new Error('No Parquet file selected.');
+      if (!memories.length) throw new Error('Shared WebAssembly.Memory bank not allocated.');
+
+      const sql = sqlInput.value.trim();
+      if (!sql) throw new Error('SQL query is empty.');
+      const maxBatchesValue = Number(maxBatchesInput.value);
+      const maxBatches = Number.isFinite(maxBatchesValue) && maxBatchesValue > 0 ? Math.trunc(maxBatchesValue) : Infinity;
+
+      proveBtn.disabled = true;
+      router = new WasmMemoryRouter(memories);
+      lastRouteElapsedMs = 0;
+      lastProofElapsedMs = 0;
+      lastRustChecksum = null;
+      updateMetrics(0);
+      proofStatusEl.className = 'status warn';
+      proofStatusEl.textContent = 'Routing in progress...';
+
+      log('Running DuckDB query as Arrow stream...');
+      log(sql);
+      const startedAt = performance.now();
+      let batchIndex = 0;
+      const reader = await conn.send(sql);
+
+      for await (const batch of reader) {
+        if (batchIndex >= maxBatches) {
+          log(`Reached configured max batch count (${maxBatches}). Stopping stream consumption.`);
+          break;
+        }
+        const bytes = recordBatchToIPCBytes(batch);
+        router.writeBytes(bytes, batch.numRows);
+        batchIndex++;
+        if (batchIndex === 1 || batchIndex % 1000 === 0) {
+          log(`Routed batch ${batchIndex}: rows so far=${formatNumber(router.totalRows)}, Arrow bytes=${formatBytes(router.totalRoutedBytes)}, free bank=${formatBytes(router.freeBytes)}.`);
+          updateMetrics(0);
+          await sleep(0);
+        }
+      }
+
+      lastRouteElapsedMs = performance.now() - startedAt;
+      proofStatusEl.className = 'status warn';
+      proofStatusEl.textContent = 'Routing complete. Ready to run Rust zero-copy proof.';
+      log(`Routing complete. Stored ${formatNumber(router.entries.length)} batch(es), ${formatNumber(router.totalRows)} row(s), ${formatBytes(router.totalRoutedBytes)} Arrow bytes in ${(lastRouteElapsedMs / 1000).toFixed(1)} s.`);
+      proveBtn.disabled = router.entries.length === 0;
+      updateMetrics(0);
+    }
+
+    function createRustWorkerUrl() {
+      const source = `
+        let compiledModule = null;
+        const instanceCache = new Map();
+
+        async function getCompiledModule(wasmBytes) {
+          if (!compiledModule) {
+            compiledModule = await WebAssembly.compile(wasmBytes);
+          }
+          return compiledModule;
+        }
+
+        async function getInstance(memory, module, shardIndex) {
+          if (!instanceCache.has(shardIndex)) {
+            const instance = await WebAssembly.instantiate(module, { env: { memory } });
+            instanceCache.set(shardIndex, instance);
+          }
+          return instanceCache.get(shardIndex);
+        }
+
+        self.onmessage = async (event) => {
+          const { workerId, wasmBytes, memories, entries } = event.data;
+          try {
+            const module = await getCompiledModule(wasmBytes);
+            let checksum = 0;
+            let bytesRead = 0;
+            let placementsVisited = 0;
+
+            for (const entry of entries) {
+              for (const placement of entry.placements) {
+                const memory = memories[placement.shardIndex];
+                const instance = await getInstance(memory, module, placement.shardIndex);
+                const part = instance.exports.checksum_u8_range(placement.offset, placement.length);
+                checksum += Number(part);
+                bytesRead += placement.length;
+                placementsVisited++;
+              }
+            }
+
+            self.postMessage({ ok: true, workerId, checksum, bytesRead, placementsVisited, batches: entries.length });
+          } catch (error) {
+            self.postMessage({ ok: false, workerId, error: error.message || String(error) });
+          }
+        };
+      `;
+      return URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    }
+
+    async function proveRustZeroCopy() {
+      if (!rustWasmBytes) throw new Error('Rust module not loaded.');
+      if (!router || router.entries.length === 0) throw new Error('No routed Arrow bytes available.');
+
+      const workerCount = Number(workerCountInput.value);
+      if (!Number.isFinite(workerCount) || workerCount <= 0) throw new Error('Invalid worker count.');
+
+      proofStatusEl.className = 'status warn';
+      proofStatusEl.textContent = 'Running 4-worker Rust zero-copy checksum proof...';
+      lastProofElapsedMs = 0;
+      lastRustChecksum = null;
+      updateMetrics(0);
+
+      const buckets = Array.from({ length: workerCount }, () => []);
+      router.entries.forEach((entry, index) => buckets[index % workerCount].push(entry));
+      const workerUrl = createRustWorkerUrl();
+      const startedAt = performance.now();
+      let completed = 0;
+
+      const workerResults = await new Promise((resolve, reject) => {
+        const results = [];
+        for (let workerId = 0; workerId < workerCount; workerId++) {
+          const worker = new Worker(workerUrl);
+          worker.onmessage = (event) => {
+            const data = event.data;
+            worker.terminate();
+            if (!data.ok) {
+              reject(new Error(`Rust worker ${data.workerId} failed: ${data.error}`));
+              return;
+            }
+            results.push(data);
+            completed++;
+            log(`Rust worker ${data.workerId} done: batches=${formatNumber(data.batches)}, placements=${formatNumber(data.placementsVisited)}, bytes=${formatBytes(data.bytesRead)}.`);
+            updateMetrics(completed);
+            if (completed === workerCount) resolve(results);
+          };
+          worker.onerror = (error) => {
+            worker.terminate();
+            reject(error);
+          };
+          worker.postMessage({ workerId, wasmBytes: rustWasmBytes, memories, entries: buckets[workerId] });
+        }
+      }).finally(() => {
+        URL.revokeObjectURL(workerUrl);
+      });
+
+      lastProofElapsedMs = performance.now() - startedAt;
+      lastRustChecksum = workerResults.reduce((sum, result) => sum + result.checksum, 0);
+      const success = lastRustChecksum === router.jsChecksum;
+      updateMetrics(workerCount);
+
+      if (success) {
+        proofStatusEl.className = 'status good';
+        proofStatusEl.textContent = `SUCCESS: Rust checksum matched JS checksum across ${formatBytes(router.totalRoutedBytes)} routed Arrow bytes.`;
+        log(`SUCCESS: zero-copy Rust read proof passed in ${(lastProofElapsedMs / 1000).toFixed(1)} s.`);
+      } else {
+        proofStatusEl.className = 'status bad';
+        proofStatusEl.textContent = `Checksum mismatch: JS=${router.jsChecksum}, Rust=${lastRustChecksum}`;
+        log(`FAIL: checksum mismatch. JS=${router.jsChecksum}, Rust=${lastRustChecksum}.`);
+      }
+    }
+
+    async function releaseAll() {
+      memories = [];
+      router = null;
+      lastRouteElapsedMs = 0;
+      lastProofElapsedMs = 0;
+      lastRustChecksum = null;
+      proveBtn.disabled = true;
+      updateMetrics(0);
+      proofStatusEl.className = 'status warn';
+      proofStatusEl.textContent = 'Released wasm-memory shard bank.';
+      log('Released shared WebAssembly.Memory shard bank references.');
+    }
+
+    initDuckdbBtn.addEventListener('click', () => {
+      initDuckDB().catch((error) => {
+        duckdbStatusEl.className = 'status bad';
+        duckdbStatusEl.textContent = `DuckDB init failed: ${error.message}`;
+        log(`DuckDB init failed: ${error.message}`);
+      });
+    });
+
+    initRustBtn.addEventListener('click', () => {
+      initRustModule().catch((error) => {
+        rustStatusEl.className = 'status bad';
+        rustStatusEl.textContent = `Rust module load failed: ${error.message}`;
+        log(`Rust module load failed: ${error.message}`);
+      });
+    });
+
+    pickFileBtn.addEventListener('click', () => {
+      pickParquetFile().catch((error) => {
+        fileStatusEl.className = 'status bad';
+        fileStatusEl.textContent = `File selection/registration failed: ${error.message}`;
+        log(`File pick/register failed: ${error.message}`);
+      });
+    });
+
+    allocateBtn.addEventListener('click', () => {
+      allocateWasmBank().catch((error) => log(`Allocation failed: ${error.message}`));
+    });
+
+    routeBtn.addEventListener('click', () => {
+      routeQueryIntoBank().catch((error) => {
+        proofStatusEl.className = 'status bad';
+        proofStatusEl.textContent = `Routing failed: ${error.message}`;
+        log(`Routing failed: ${error.message}`);
+      });
+    });
+
+    proveBtn.addEventListener('click', () => {
+      proveRustZeroCopy().catch((error) => {
+        proofStatusEl.className = 'status bad';
+        proofStatusEl.textContent = `Rust zero-copy proof failed: ${error.message}`;
+        log(`Rust zero-copy proof failed: ${error.message}`);
+      });
+    });
+
+    releaseBtn.addEventListener('click', () => {
+      releaseAll().catch((error) => log(`Release failed: ${error.message}`));
+    });
+
+    updateIsolationStatus();
+    updateMetrics(0);
+    renderResults();
+    log('Ready. Init DuckDB-Wasm, load the Rust module, pick the 6 GiB parquet, allocate a 12 GiB shared WebAssembly.Memory bank, route the query, then run the zero-copy Rust proof.');
+  </script>
+</body>
+</html>

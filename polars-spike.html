@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Polars Browser Spike</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #121a33;
+      --panel-2: #0f1730;
+      --text: #e7ecff;
+      --muted: #a6b0d5;
+      --good: #66e3a4;
+      --warn: #ffd166;
+      --bad: #ff7b7b;
+      --border: #26345f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #0a0f1d, #0b1020 40%, #0d1327);
+      color: var(--text);
+    }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 32px 20px 48px; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { margin: 8px 0; color: var(--muted); }
+    .card {
+      background: rgba(18, 26, 51, 0.9);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      margin-top: 18px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.22);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    input, button {
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+    }
+    button {
+      border: 0;
+      background: linear-gradient(180deg, #1c6fff, #1758cc);
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .secondary { background: #1a2447; border: 1px solid var(--border); }
+    .status {
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #101833;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
+    .status.good { border-color: rgba(102, 227, 164, .35); color: var(--good); }
+    .status.warn { border-color: rgba(255, 209, 102, .35); color: var(--warn); }
+    .status.bad { border-color: rgba(255, 123, 123, .35); color: var(--bad); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .metric {
+      background: #0e1630;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .metric .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .metric .value { margin-top: 8px; font-size: 22px; font-weight: 800; }
+    pre {
+      margin: 0;
+      background: #0b1228;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+      max-height: 360px;
+      color: #cfe0ff;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .small { font-size: 12px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Polars Browser Spike</h1>
+    <p>
+      This is a minimal feasibility spike: compile Polars to browser Wasm, initialize it in Chromium,
+      and run a small generated DataFrame workload. It is <strong>not</strong> yet integrated with the shard bank.
+    </p>
+
+    <div id="status" class="status warn">Polars wasm not loaded yet.</div>
+
+    <div class="card">
+      <strong>Actions</strong>
+      <div class="grid">
+        <label>
+          Generated rows
+          <input id="rowsInput" type="number" min="1" step="1000" value="1000000" />
+        </label>
+      </div>
+      <div class="row">
+        <button id="loadBtn">1. Load Polars wasm</button>
+        <button id="smokeBtn" class="secondary" disabled>2. Run smoke test</button>
+        <button id="runBtn" disabled>3. Run generated workload</button>
+      </div>
+      <p class="small">
+        Start with 1,000,000 rows. Then try 5,000,000 or 10,000,000 if the browser remains responsive.
+      </p>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="label">Wasm size</div><div id="wasmSizeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Load/init time</div><div id="loadTimeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Smoke result</div><div id="smokeResultValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Workload time</div><div id="workloadTimeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Polars sum</div><div id="polarsSumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">JS sum</div><div id="jsSumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Polars label1 count</div><div id="polarsCountValue" class="value">-</div></div>
+      <div class="metric"><div class="label">JS label1 count</div><div id="jsCountValue" class="value">-</div></div>
+    </div>
+
+    <div class="card">
+      <strong>Result</strong>
+      <pre id="result"></pre>
+    </div>
+
+    <div class="card">
+      <strong>Log</strong>
+      <pre id="log"></pre>
+    </div>
+  </div>
+
+  <script type="module">
+    import initPolars from './polars-web/polars_spike.js';
+
+    const $ = (id) => document.getElementById(id);
+    const statusEl = $('status');
+    const logEl = $('log');
+    const resultEl = $('result');
+    const loadBtn = $('loadBtn');
+    const smokeBtn = $('smokeBtn');
+    const runBtn = $('runBtn');
+    const rowsInput = $('rowsInput');
+
+    let polars = null;
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      logEl.textContent += `[${time}] ${message}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes)) return '-';
+      const units = ['B', 'KiB', 'MiB', 'GiB'];
+      let value = bytes;
+      let index = 0;
+      while (value >= 1024 && index < units.length - 1) {
+        value /= 1024;
+        index++;
+      }
+      return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[index]}`;
+    }
+
+    function formatNumber(value, digits = 2) {
+      if (!Number.isFinite(value)) return '-';
+      return new Intl.NumberFormat(undefined, {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: digits,
+      }).format(value);
+    }
+
+    function setStatus(kind, text) {
+      statusEl.className = `status ${kind}`;
+      statusEl.textContent = text;
+    }
+
+    function jsReference(rows) {
+      let sum = 0;
+      let count = 0;
+      for (let i = 0; i < rows; i++) {
+        const value = ((i % 1000) * 0.5) - 100.0;
+        const label = (i % 3 === 0 || i % 5 === 0) ? 1 : 0;
+        if (label === 1) {
+          sum += value;
+          count++;
+        }
+      }
+      return { sum, count };
+    }
+
+    async function loadPolars() {
+      setStatus('warn', 'Loading Polars wasm...');
+      const startedAt = performance.now();
+      const response = await fetch('./polars-web/polars_spike_bg.wasm');
+      const wasmBytes = await response.arrayBuffer();
+      $('wasmSizeValue').textContent = formatBytes(wasmBytes.byteLength);
+      polars = await initPolars(wasmBytes);
+      const endedAt = performance.now();
+      $('loadTimeValue').textContent = `${(endedAt - startedAt).toFixed(1)} ms`;
+      setStatus('good', 'Polars wasm loaded successfully.');
+      smokeBtn.disabled = false;
+      runBtn.disabled = false;
+      log(`Loaded Polars wasm (${formatBytes(wasmBytes.byteLength)}) in ${(endedAt - startedAt).toFixed(1)} ms.`);
+    }
+
+    function runSmokeTest() {
+      const result = polars.polars_smoke_test();
+      $('smokeResultValue').textContent = formatNumber(result, 4);
+      log(`Smoke test result: ${result}`);
+      if (Math.abs(result - 5.5) < 1e-9) {
+        setStatus('good', 'Smoke test passed. Polars is executing in the browser.');
+      } else {
+        setStatus('warn', `Unexpected smoke result: ${result}`);
+      }
+    }
+
+    function runGeneratedWorkload() {
+      const rows = Math.trunc(Number(rowsInput.value));
+      if (!Number.isFinite(rows) || rows <= 0) {
+        setStatus('bad', 'Invalid row count.');
+        return;
+      }
+      setStatus('warn', `Running generated Polars workload for ${rows.toLocaleString()} rows...`);
+      const startedAt = performance.now();
+      const polarsSum = polars.polars_generated_sum(rows);
+      const polarsCount = polars.polars_generated_label1_count(rows);
+      const endedAt = performance.now();
+      const js = jsReference(rows);
+
+      $('workloadTimeValue').textContent = `${(endedAt - startedAt).toFixed(1)} ms`;
+      $('polarsSumValue').textContent = formatNumber(polarsSum, 4);
+      $('jsSumValue').textContent = formatNumber(js.sum, 4);
+      $('polarsCountValue').textContent = formatNumber(polarsCount, 0);
+      $('jsCountValue').textContent = formatNumber(js.count, 0);
+
+      const success = Math.abs(polarsSum - js.sum) <= 1e-6 * Math.max(1, Math.abs(js.sum)) && polarsCount === js.count;
+      resultEl.textContent = JSON.stringify({
+        rows,
+        polarsSum,
+        jsSum: js.sum,
+        polarsCount,
+        jsCount: js.count,
+        elapsedMs: endedAt - startedAt,
+        success,
+      }, null, 2);
+
+      if (success) {
+        setStatus('good', `Polars workload passed for ${rows.toLocaleString()} rows.`);
+      } else {
+        setStatus('bad', 'Polars result mismatch.');
+      }
+      log(`Generated workload: rows=${rows}, elapsed=${(endedAt - startedAt).toFixed(1)} ms, success=${success}`);
+    }
+
+    loadBtn.addEventListener('click', () => {
+      loadPolars().catch((error) => {
+        setStatus('bad', `Load failed: ${error.message}`);
+        log(`Load failed: ${error.message}`);
+      });
+    });
+
+    smokeBtn.addEventListener('click', () => {
+      try {
+        runSmokeTest();
+      } catch (error) {
+        setStatus('bad', `Smoke test failed: ${error.message}`);
+        log(`Smoke test failed: ${error.message}`);
+      }
+    });
+
+    runBtn.addEventListener('click', () => {
+      try {
+        runGeneratedWorkload();
+      } catch (error) {
+        setStatus('bad', `Generated workload failed: ${error.message}`);
+        log(`Generated workload failed: ${error.message}`);
+      }
+    });
+
+    resultEl.textContent = 'No result yet.';
+    log('Ready. Load Polars wasm, run the smoke test, then run the generated workload.');
+  </script>
+</body>
+</html>

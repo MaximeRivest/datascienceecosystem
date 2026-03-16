@@ -1,0 +1,558 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MVT 1 - Zero-Copy Memory Proof</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #121a33;
+      --panel-2: #0f1730;
+      --text: #e7ecff;
+      --muted: #a6b0d5;
+      --accent: #7cc7ff;
+      --good: #66e3a4;
+      --warn: #ffd166;
+      --bad: #ff7b7b;
+      --border: #26345f;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #0a0f1d, #0b1020 40%, #0d1327);
+      color: var(--text);
+    }
+
+    .wrap {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+    }
+
+    p {
+      margin: 8px 0;
+      color: var(--muted);
+    }
+
+    .card {
+      background: rgba(18, 26, 51, 0.9);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      margin-top: 18px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.22);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+
+    input, button {
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+    }
+
+    button {
+      background: linear-gradient(180deg, #1c6fff, #1758cc);
+      border: 0;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
+    .secondary {
+      background: #1a2447;
+      border: 1px solid var(--border);
+    }
+
+    .row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 16px;
+    }
+
+    .status {
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #101833;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
+
+    .status.good { border-color: rgba(102, 227, 164, 0.35); color: var(--good); }
+    .status.warn { border-color: rgba(255, 209, 102, 0.35); color: var(--warn); }
+    .status.bad { border-color: rgba(255, 123, 123, 0.35); color: var(--bad); }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .metric {
+      background: #0e1630;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+
+    .metric .label {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .metric .value {
+      margin-top: 8px;
+      font-size: 22px;
+      font-weight: 800;
+    }
+
+    pre {
+      margin: 0;
+      background: #0b1228;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+      max-height: 360px;
+      color: #cfe0ff;
+    }
+
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+
+    .small {
+      font-size: 12px;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>MVT 1: Zero-Copy Memory Proof</h1>
+    <p>
+      Single-file HTML demo. The main thread allocates one <code>SharedArrayBuffer</code>,
+      then 4 Web Workers sum separate chunks of the same shared memory without cloning it.
+    </p>
+
+    <div id="isolationStatus" class="status warn">Checking browser isolation requirements...</div>
+
+    <div class="card">
+      <strong>Test setup</strong>
+      <div class="grid">
+        <label>
+          Buffer size (MiB)
+          <input id="sizeMiB" type="number" min="16" step="16" value="1024" />
+        </label>
+        <label>
+          Worker count
+          <input id="workerCount" type="number" min="1" max="32" step="1" value="4" />
+        </label>
+        <label>
+          Fill value per int
+          <input id="fillValue" type="number" min="1" step="1" value="1" />
+        </label>
+        <label>
+          Read passes per worker
+          <input id="passCount" type="number" min="1" step="1" value="8" />
+        </label>
+        <label>
+          Hold allocation after run (seconds)
+          <input id="holdSeconds" type="number" min="0" step="1" value="10" />
+        </label>
+      </div>
+
+      <div class="row">
+        <button id="startBtn">Run test</button>
+        <button id="resetBtn" class="secondary">Reset</button>
+      </div>
+
+      <p class="small">
+        Recommended: start with 256 MiB if your machine/browser is memory constrained, then raise to 1024 MiB.
+        In Chrome Task Manager, the tab should stay near the selected allocation size instead of multiplying by worker count.
+      </p>
+    </div>
+
+    <div class="metrics">
+      <div class="metric">
+        <div class="label">Allocation</div>
+        <div id="allocationValue" class="value">-</div>
+      </div>
+      <div class="metric">
+        <div class="label">Typed array length</div>
+        <div id="arrayLengthValue" class="value">-</div>
+      </div>
+      <div class="metric">
+        <div class="label">Expected sum</div>
+        <div id="expectedSumValue" class="value">-</div>
+      </div>
+      <div class="metric">
+        <div class="label">Actual sum</div>
+        <div id="actualSumValue" class="value">-</div>
+      </div>
+      <div class="metric">
+        <div class="label">Elapsed</div>
+        <div id="elapsedValue" class="value">-</div>
+      </div>
+      <div class="metric">
+        <div class="label">Chrome heap used*</div>
+        <div id="heapValue" class="value">-</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <strong>Log</strong>
+      <pre id="log"></pre>
+      <p class="small">
+        * <code>performance.memory</code> is Chrome-only and reflects JS heap, not full process memory.
+        For the real proof, use Chrome Task Manager.
+      </p>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const logEl = $("log");
+    const isolationStatusEl = $("isolationStatus");
+    const startBtn = $("startBtn");
+    const resetBtn = $("resetBtn");
+    const sizeMiBInput = $("sizeMiB");
+    const workerCountInput = $("workerCount");
+    const fillValueInput = $("fillValue");
+    const passCountInput = $("passCount");
+    const holdSecondsInput = $("holdSeconds");
+
+    let workers = [];
+    let sharedBuffer = null;
+    let memoryPoll = null;
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      logEl.textContent += `[${time}] ${message}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes)) return "-";
+      const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+      let value = bytes;
+      let unitIndex = 0;
+      while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex++;
+      }
+      return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[unitIndex]}`;
+    }
+
+    function formatNumber(value) {
+      if (typeof value === "bigint") return value.toString();
+      if (!Number.isFinite(value)) return "-";
+      return new Intl.NumberFormat().format(value);
+    }
+
+    function updateIsolationStatus() {
+      if (window.crossOriginIsolated) {
+        isolationStatusEl.className = "status good";
+        isolationStatusEl.textContent = "crossOriginIsolated = true. SharedArrayBuffer is available.";
+      } else {
+        isolationStatusEl.className = "status bad";
+        isolationStatusEl.textContent = [
+          "crossOriginIsolated = false. SharedArrayBuffer will not work.",
+          "Serve this file over HTTPS or localhost with these headers:",
+          "Cross-Origin-Opener-Policy: same-origin",
+          "Cross-Origin-Embedder-Policy: require-corp"
+        ].join("\n");
+      }
+    }
+
+    function updateHeapMetric() {
+      const heapValueEl = $("heapValue");
+      if (performance.memory && Number.isFinite(performance.memory.usedJSHeapSize)) {
+        heapValueEl.textContent = formatBytes(performance.memory.usedJSHeapSize);
+      } else {
+        heapValueEl.textContent = "n/a";
+      }
+    }
+
+    function clearMetrics() {
+      $("allocationValue").textContent = "-";
+      $("arrayLengthValue").textContent = "-";
+      $("expectedSumValue").textContent = "-";
+      $("actualSumValue").textContent = "-";
+      $("elapsedValue").textContent = "-";
+      $("heapValue").textContent = "-";
+    }
+
+    function cleanupWorkers() {
+      for (const worker of workers) {
+        worker.terminate();
+      }
+      workers = [];
+    }
+
+    function resetAll() {
+      cleanupWorkers();
+      sharedBuffer = null;
+      if (memoryPoll) {
+        clearInterval(memoryPoll);
+        memoryPoll = null;
+      }
+      clearMetrics();
+      logEl.textContent = "";
+      startBtn.disabled = false;
+      log("Reset complete.");
+      updateHeapMetric();
+    }
+
+    function createWorkerBlobUrl() {
+      const workerSource = `
+        self.onmessage = (event) => {
+          const { sab, startIndex, endIndex, workerId, passCount } = event.data;
+          const view = new Int32Array(sab);
+          let sum = 0n;
+          const startedAt = performance.now();
+
+          for (let pass = 0; pass < passCount; pass++) {
+            for (let i = startIndex; i < endIndex; i++) {
+              sum += BigInt(view[i]);
+            }
+          }
+
+          const endedAt = performance.now();
+          self.postMessage({
+            workerId,
+            sum: sum.toString(),
+            startIndex,
+            endIndex,
+            passCount,
+            durationMs: endedAt - startedAt
+          });
+        };
+      `;
+
+      return URL.createObjectURL(new Blob([workerSource], { type: "text/javascript" }));
+    }
+
+    async function runTest() {
+      if (!window.crossOriginIsolated) {
+        updateIsolationStatus();
+        log("Blocked: SharedArrayBuffer requires cross-origin isolation.");
+        return;
+      }
+
+      startBtn.disabled = true;
+      cleanupWorkers();
+      logEl.textContent = "";
+      clearMetrics();
+
+      const sizeMiB = Number(sizeMiBInput.value);
+      const workerCount = Number(workerCountInput.value);
+      const fillValue = Number(fillValueInput.value);
+      const passCount = Number(passCountInput.value);
+      const holdSeconds = Number(holdSecondsInput.value);
+
+      if (!Number.isFinite(sizeMiB) || sizeMiB <= 0) {
+        log("Invalid buffer size.");
+        startBtn.disabled = false;
+        return;
+      }
+
+      if (!Number.isFinite(workerCount) || workerCount <= 0) {
+        log("Invalid worker count.");
+        startBtn.disabled = false;
+        return;
+      }
+
+      if (!Number.isFinite(fillValue)) {
+        log("Invalid fill value.");
+        startBtn.disabled = false;
+        return;
+      }
+
+      if (!Number.isFinite(passCount) || passCount <= 0) {
+        log("Invalid pass count.");
+        startBtn.disabled = false;
+        return;
+      }
+
+      if (!Number.isFinite(holdSeconds) || holdSeconds < 0) {
+        log("Invalid hold duration.");
+        startBtn.disabled = false;
+        return;
+      }
+
+      const totalBytes = sizeMiB * 1024 * 1024;
+      if (totalBytes % Int32Array.BYTES_PER_ELEMENT !== 0) {
+        log("Buffer size must be divisible by 4 bytes for Int32Array.");
+        startBtn.disabled = false;
+        return;
+      }
+
+      const normalizedFillValue = Math.trunc(fillValue);
+      if (normalizedFillValue < -2147483648 || normalizedFillValue > 2147483647) {
+        log("Fill value must fit in a signed 32-bit integer.");
+        startBtn.disabled = false;
+        return;
+      }
+
+      const normalizedPassCount = Math.trunc(passCount);
+      const normalizedHoldSeconds = Math.trunc(holdSeconds);
+      const totalInts = totalBytes / Int32Array.BYTES_PER_ELEMENT;
+      const expectedSum = BigInt(totalInts) * BigInt(normalizedFillValue) * BigInt(normalizedPassCount);
+
+      $("allocationValue").textContent = formatBytes(totalBytes);
+      $("arrayLengthValue").textContent = formatNumber(totalInts);
+      $("expectedSumValue").textContent = formatNumber(expectedSum);
+
+      log(`Allocating SharedArrayBuffer of ${formatBytes(totalBytes)}...`);
+      const setupStart = performance.now();
+
+      try {
+        sharedBuffer = new SharedArrayBuffer(totalBytes);
+      } catch (error) {
+        log(`Allocation failed: ${error.message}`);
+        startBtn.disabled = false;
+        return;
+      }
+
+      const view = new Int32Array(sharedBuffer);
+      log(`Filling ${formatNumber(view.length)} int32 values with ${normalizedFillValue}...`);
+      view.fill(normalizedFillValue);
+      log("Fill complete.");
+
+      updateHeapMetric();
+      if (memoryPoll) clearInterval(memoryPoll);
+      memoryPoll = setInterval(updateHeapMetric, 1000);
+
+      const workerUrl = createWorkerBlobUrl();
+      const chunkSize = Math.ceil(totalInts / workerCount);
+      let finished = 0;
+      let activeWorkers = 0;
+      let actualSum = 0n;
+      const startedAt = performance.now();
+
+      log(`Starting ${workerCount} worker(s) with ${normalizedPassCount} read pass(es) each...`);
+      log("Open Chrome Task Manager now and observe memory while workers run.");
+
+      await new Promise((resolve, reject) => {
+        for (let workerId = 0; workerId < workerCount; workerId++) {
+          const startIndex = workerId * chunkSize;
+          const endIndex = Math.min(startIndex + chunkSize, totalInts);
+          if (startIndex >= endIndex) {
+            continue;
+          }
+
+          const worker = new Worker(workerUrl);
+          workers.push(worker);
+          activeWorkers++;
+
+          worker.onmessage = (event) => {
+            const { workerId, sum, startIndex, endIndex, passCount, durationMs } = event.data;
+            actualSum += BigInt(sum);
+            finished++;
+            log(`Worker ${workerId} done: indexes [${formatNumber(startIndex)}, ${formatNumber(endIndex)}) across ${passCount} pass(es) in ${durationMs.toFixed(1)} ms, partial sum=${sum}`);
+
+            if (finished === activeWorkers) {
+              resolve();
+            }
+          };
+
+          worker.onerror = (error) => {
+            reject(error);
+          };
+
+          worker.postMessage({
+            sab: sharedBuffer,
+            workerId,
+            startIndex,
+            endIndex,
+            passCount: normalizedPassCount
+          });
+        }
+
+        if (activeWorkers === 0) {
+          resolve();
+        }
+      }).catch((error) => {
+        log(`Worker error: ${error.message || error}`);
+        throw error;
+      }).finally(() => {
+        URL.revokeObjectURL(workerUrl);
+      });
+
+      const endedAt = performance.now();
+      const elapsedMs = endedAt - startedAt;
+      const totalElapsedMs = endedAt - setupStart;
+
+      $("actualSumValue").textContent = formatNumber(actualSum);
+      $("elapsedValue").textContent = `${elapsedMs.toFixed(1)} ms`;
+
+      if (actualSum === expectedSum) {
+        log(`SUCCESS: actual sum matches expected sum (${actualSum.toString()}).`);
+      } else {
+        log(`FAIL: actual sum ${actualSum.toString()} does not match expected ${expectedSum.toString()}.`);
+      }
+
+      log(`Worker compute time: ${elapsedMs.toFixed(1)} ms`);
+      log(`Total setup + compute time: ${totalElapsedMs.toFixed(1)} ms`);
+      log("MVT 1 interpretation: if Chrome Task Manager stays near the original allocation instead of scaling with worker count, the zero-copy proof is successful.");
+
+      cleanupWorkers();
+
+      if (normalizedHoldSeconds > 0) {
+        log(`Holding SharedArrayBuffer allocation for ${normalizedHoldSeconds} second(s) so you can inspect Chrome Task Manager...`);
+        await new Promise((resolve) => setTimeout(resolve, normalizedHoldSeconds * 1000));
+      }
+
+      startBtn.disabled = false;
+    }
+
+    startBtn.addEventListener("click", () => {
+      runTest().catch((error) => {
+        log(`Unhandled error: ${error.message || error}`);
+        startBtn.disabled = false;
+      });
+    });
+
+    resetBtn.addEventListener("click", resetAll);
+
+    updateIsolationStatus();
+    updateHeapMetric();
+    log("Ready. Serve this file with COOP/COEP headers before running.");
+  </script>
+</body>
+</html>

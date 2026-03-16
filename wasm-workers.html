@@ -1,0 +1,546 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MVT 1.5 - Shared Wasm Memory Workers</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #121a33;
+      --panel-2: #0f1730;
+      --text: #e7ecff;
+      --muted: #a6b0d5;
+      --good: #66e3a4;
+      --warn: #ffd166;
+      --bad: #ff7b7b;
+      --border: #26345f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #0a0f1d, #0b1020 40%, #0d1327);
+      color: var(--text);
+    }
+    .wrap {
+      max-width: 1060px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { margin: 8px 0; color: var(--muted); }
+    .card {
+      background: rgba(18, 26, 51, 0.9);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      margin-top: 18px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.22);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+    label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    input, button {
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+    }
+    button {
+      background: linear-gradient(180deg, #1c6fff, #1758cc);
+      border: 0;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .secondary { background: #1a2447; border: 1px solid var(--border); }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    .status {
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #101833;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
+    .status.good { border-color: rgba(102, 227, 164, 0.35); color: var(--good); }
+    .status.warn { border-color: rgba(255, 209, 102, 0.35); color: var(--warn); }
+    .status.bad { border-color: rgba(255, 123, 123, 0.35); color: var(--bad); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .metric {
+      background: #0e1630;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .metric .label {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .metric .value {
+      margin-top: 8px;
+      font-size: 22px;
+      font-weight: 800;
+    }
+    pre {
+      margin: 0;
+      background: #0b1228;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+      max-height: 360px;
+      color: #cfe0ff;
+    }
+    .small { font-size: 12px; color: var(--muted); }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>MVT 1.5: Shared Wasm Memory → 4 Web Workers</h1>
+    <p>
+      This prototype replaces the raw <code>SharedArrayBuffer</code> with a shared
+      <code>WebAssembly.Memory</code>. The same memory is imported into 4 workers,
+      and a Rust-compiled Wasm function sums assigned ranges.
+    </p>
+
+    <div id="envStatus" class="status warn">Checking browser + Wasm shared-memory requirements...</div>
+    <div id="limitStatus" class="status warn">Single shared Wasm memory above 4 GiB is usually unavailable in current Chromium unless memory64 support is present.</div>
+
+    <div class="card">
+      <strong>Test setup</strong>
+      <div class="grid">
+        <label>
+          Shared Wasm memory size (MiB)
+          <input id="sizeMiB" type="number" min="16" step="16" value="1024" />
+        </label>
+        <label>
+          Worker count
+          <input id="workerCount" type="number" min="1" max="32" step="1" value="4" />
+        </label>
+        <label>
+          Fill value per int32
+          <input id="fillValue" type="number" min="1" step="1" value="1" />
+        </label>
+        <label>
+          Wasm passes per worker
+          <input id="passCount" type="number" min="1" step="1" value="8" />
+        </label>
+        <label>
+          Hold allocation after run (seconds)
+          <input id="holdSeconds" type="number" min="0" step="1" value="10" />
+        </label>
+      </div>
+
+      <div class="row">
+        <button id="startBtn">Run Wasm worker test</button>
+        <button id="resetBtn" class="secondary">Reset</button>
+      </div>
+
+      <p class="small">
+        Use this to validate zero-copy shared data access from Wasm workers. For an 8 GiB goal,
+        first try <code>8192</code> MiB here. If allocation fails, that means a single shared Wasm memory
+        is not available at that size in this browser/runtime. In that case, use multiple shards.
+      </p>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="label">Allocation</div><div id="allocationValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Wasm pages</div><div id="pageCountValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Typed array length</div><div id="arrayLengthValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Expected sum</div><div id="expectedSumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Actual sum</div><div id="actualSumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Elapsed</div><div id="elapsedValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Chrome heap used*</div><div id="heapValue" class="value">-</div></div>
+    </div>
+
+    <div class="card">
+      <strong>Log</strong>
+      <pre id="log"></pre>
+      <p class="small">
+        * <code>performance.memory</code> is JS heap only. Use Chrome Task Manager for process memory.
+      </p>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const logEl = $("log");
+    const envStatusEl = $("envStatus");
+    const limitStatusEl = $("limitStatus");
+    const startBtn = $("startBtn");
+    const resetBtn = $("resetBtn");
+    const sizeMiBInput = $("sizeMiB");
+    const workerCountInput = $("workerCount");
+    const fillValueInput = $("fillValue");
+    const passCountInput = $("passCount");
+    const holdSecondsInput = $("holdSeconds");
+
+    let workers = [];
+    let sharedMemory = null;
+    let memoryPoll = null;
+    let compiledModule = null;
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      logEl.textContent += `[${time}] ${message}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes)) return "-";
+      const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+      let value = bytes;
+      let unitIndex = 0;
+      while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex++;
+      }
+      return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[unitIndex]}`;
+    }
+
+    function formatNumber(value) {
+      if (typeof value === "bigint") return value.toString();
+      if (!Number.isFinite(value)) return "-";
+      return new Intl.NumberFormat().format(value);
+    }
+
+    function updateEnvStatus() {
+      if (!window.crossOriginIsolated) {
+        envStatusEl.className = "status bad";
+        envStatusEl.textContent = [
+          "crossOriginIsolated = false. Shared Wasm memory will not work.",
+          "Required headers:",
+          "Cross-Origin-Opener-Policy: same-origin",
+          "Cross-Origin-Embedder-Policy: require-corp"
+        ].join("\n");
+        return;
+      }
+
+      if (!("WebAssembly" in window) || typeof WebAssembly.Memory !== "function") {
+        envStatusEl.className = "status bad";
+        envStatusEl.textContent = "WebAssembly.Memory is not available in this browser.";
+        return;
+      }
+
+      envStatusEl.className = "status good";
+      envStatusEl.textContent = "crossOriginIsolated = true. Shared WebAssembly.Memory should be available.";
+    }
+
+    function updateLimitStatus() {
+      const requestedMiB = Number(sizeMiBInput.value);
+      if (Number.isFinite(requestedMiB) && requestedMiB > 4096) {
+        limitStatusEl.className = "status warn";
+        limitStatusEl.textContent = "Requested size exceeds 4 GiB. Expect failure in most current browsers unless shared memory64 is available.";
+      } else {
+        limitStatusEl.className = "status good";
+        limitStatusEl.textContent = "Requested size is within the common <= 4 GiB single shared Wasm memory envelope.";
+      }
+    }
+
+    function updateHeapMetric() {
+      const heapValueEl = $("heapValue");
+      if (performance.memory && Number.isFinite(performance.memory.usedJSHeapSize)) {
+        heapValueEl.textContent = formatBytes(performance.memory.usedJSHeapSize);
+      } else {
+        heapValueEl.textContent = "n/a";
+      }
+    }
+
+    function clearMetrics() {
+      $("allocationValue").textContent = "-";
+      $("pageCountValue").textContent = "-";
+      $("arrayLengthValue").textContent = "-";
+      $("expectedSumValue").textContent = "-";
+      $("actualSumValue").textContent = "-";
+      $("elapsedValue").textContent = "-";
+      $("heapValue").textContent = "-";
+    }
+
+    function cleanupWorkers() {
+      for (const worker of workers) worker.terminate();
+      workers = [];
+    }
+
+    function resetAll() {
+      cleanupWorkers();
+      sharedMemory = null;
+      if (memoryPoll) {
+        clearInterval(memoryPoll);
+        memoryPoll = null;
+      }
+      clearMetrics();
+      logEl.textContent = "";
+      startBtn.disabled = false;
+      log("Reset complete.");
+      updateHeapMetric();
+    }
+
+    function createWorkerBlobUrl() {
+      const source = `
+        let cachedInstance = null;
+        let cachedModule = null;
+        let cachedMemory = null;
+
+        async function getInstance(module, memory) {
+          if (!cachedInstance || cachedModule !== module || cachedMemory !== memory) {
+            cachedModule = module;
+            cachedMemory = memory;
+            cachedInstance = await WebAssembly.instantiate(module, { env: { memory } });
+          }
+          return cachedInstance;
+        }
+
+        self.onmessage = async (event) => {
+          const { module, memory, workerId, startIndex, endIndex, passCount } = event.data;
+          const startedAt = performance.now();
+
+          try {
+            const instance = await getInstance(module, memory);
+            let sum = 0n;
+            for (let pass = 0; pass < passCount; pass++) {
+              sum += instance.exports.sum_i32_range(startIndex, endIndex);
+            }
+            const endedAt = performance.now();
+            self.postMessage({
+              ok: true,
+              workerId,
+              startIndex,
+              endIndex,
+              passCount,
+              sum: sum.toString(),
+              durationMs: endedAt - startedAt
+            });
+          } catch (error) {
+            self.postMessage({ ok: false, workerId, error: error.message || String(error) });
+          }
+        };
+      `;
+      return URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+    }
+
+    async function loadModule() {
+      if (compiledModule) return compiledModule;
+      log("Fetching Rust-compiled wasm module (wasm/sum_range.wasm)...");
+      compiledModule = await WebAssembly.compileStreaming(fetch("./wasm/sum_range.wasm"));
+      log("Wasm module compiled.");
+      return compiledModule;
+    }
+
+    async function runTest() {
+      if (!window.crossOriginIsolated) {
+        updateEnvStatus();
+        log("Blocked: cross-origin isolation is required.");
+        return;
+      }
+
+      startBtn.disabled = true;
+      cleanupWorkers();
+      logEl.textContent = "";
+      clearMetrics();
+      updateLimitStatus();
+
+      const sizeMiB = Number(sizeMiBInput.value);
+      const workerCount = Number(workerCountInput.value);
+      const fillValue = Number(fillValueInput.value);
+      const passCount = Number(passCountInput.value);
+      const holdSeconds = Number(holdSecondsInput.value);
+
+      if (!Number.isFinite(sizeMiB) || sizeMiB <= 0) {
+        log("Invalid memory size.");
+        startBtn.disabled = false;
+        return;
+      }
+      if (!Number.isFinite(workerCount) || workerCount <= 0) {
+        log("Invalid worker count.");
+        startBtn.disabled = false;
+        return;
+      }
+      if (!Number.isFinite(fillValue)) {
+        log("Invalid fill value.");
+        startBtn.disabled = false;
+        return;
+      }
+      if (!Number.isFinite(passCount) || passCount <= 0) {
+        log("Invalid pass count.");
+        startBtn.disabled = false;
+        return;
+      }
+      if (!Number.isFinite(holdSeconds) || holdSeconds < 0) {
+        log("Invalid hold duration.");
+        startBtn.disabled = false;
+        return;
+      }
+
+      const normalizedFillValue = Math.trunc(fillValue);
+      const normalizedPassCount = Math.trunc(passCount);
+      const normalizedHoldSeconds = Math.trunc(holdSeconds);
+
+      if (normalizedFillValue < -2147483648 || normalizedFillValue > 2147483647) {
+        log("Fill value must fit in a signed 32-bit integer.");
+        startBtn.disabled = false;
+        return;
+      }
+
+      const totalBytes = sizeMiB * 1024 * 1024;
+      if (totalBytes % 65536 !== 0) {
+        log("Memory size must align to 64 KiB wasm pages.");
+        startBtn.disabled = false;
+        return;
+      }
+
+      const pages = totalBytes / 65536;
+      const totalInts = totalBytes / Int32Array.BYTES_PER_ELEMENT;
+      const expectedSum = BigInt(totalInts) * BigInt(normalizedFillValue) * BigInt(normalizedPassCount);
+
+      $("allocationValue").textContent = formatBytes(totalBytes);
+      $("pageCountValue").textContent = formatNumber(pages);
+      $("arrayLengthValue").textContent = formatNumber(totalInts);
+      $("expectedSumValue").textContent = formatNumber(expectedSum);
+
+      const module = await loadModule();
+      const setupStart = performance.now();
+      log(`Allocating shared WebAssembly.Memory of ${formatBytes(totalBytes)} (${formatNumber(pages)} pages)...`);
+
+      try {
+        sharedMemory = new WebAssembly.Memory({ shared: true, initial: pages, maximum: pages });
+      } catch (error) {
+        log(`Allocation failed: ${error.message}`);
+        if (sizeMiB >= 8192) {
+          log("Interpretation: single shared Wasm memory at 8 GiB is not available in this browser/runtime. Use multiple shards instead.");
+        }
+        startBtn.disabled = false;
+        return;
+      }
+
+      const view = new Int32Array(sharedMemory.buffer);
+      log(`Filling shared Wasm memory with ${formatNumber(view.length)} int32 values...`);
+      view.fill(normalizedFillValue);
+      log("Fill complete.");
+
+      updateHeapMetric();
+      if (memoryPoll) clearInterval(memoryPoll);
+      memoryPoll = setInterval(updateHeapMetric, 1000);
+
+      const workerUrl = createWorkerBlobUrl();
+      const chunkSize = Math.ceil(totalInts / workerCount);
+      let activeWorkers = 0;
+      let finished = 0;
+      let actualSum = 0n;
+      const startedAt = performance.now();
+
+      log(`Starting ${workerCount} Wasm worker(s) with ${normalizedPassCount} pass(es) each...`);
+      log("Use Chrome Task Manager to compare 1 worker vs 4 workers memory footprint.");
+
+      await new Promise((resolve, reject) => {
+        for (let workerId = 0; workerId < workerCount; workerId++) {
+          const startIndex = workerId * chunkSize;
+          const endIndex = Math.min(startIndex + chunkSize, totalInts);
+          if (startIndex >= endIndex) continue;
+
+          const worker = new Worker(workerUrl);
+          workers.push(worker);
+          activeWorkers++;
+
+          worker.onmessage = (event) => {
+            const data = event.data;
+            if (!data.ok) {
+              reject(new Error(`Worker ${data.workerId} failed: ${data.error}`));
+              return;
+            }
+            actualSum += BigInt(data.sum);
+            finished++;
+            log(`Worker ${data.workerId} done: [${formatNumber(data.startIndex)}, ${formatNumber(data.endIndex)}) across ${data.passCount} pass(es) in ${data.durationMs.toFixed(1)} ms, partial sum=${data.sum}`);
+            if (finished === activeWorkers) resolve();
+          };
+
+          worker.onerror = (error) => reject(error);
+          worker.postMessage({
+            module,
+            memory: sharedMemory,
+            workerId,
+            startIndex,
+            endIndex,
+            passCount: normalizedPassCount
+          });
+        }
+
+        if (activeWorkers === 0) resolve();
+      }).catch((error) => {
+        log(`Worker error: ${error.message || error}`);
+        throw error;
+      }).finally(() => {
+        URL.revokeObjectURL(workerUrl);
+      });
+
+      const endedAt = performance.now();
+      const elapsedMs = endedAt - startedAt;
+      const totalElapsedMs = endedAt - setupStart;
+      $("actualSumValue").textContent = formatNumber(actualSum);
+      $("elapsedValue").textContent = `${elapsedMs.toFixed(1)} ms`;
+
+      if (actualSum === expectedSum) {
+        log(`SUCCESS: Wasm workers produced the expected sum (${actualSum.toString()}).`);
+      } else {
+        log(`FAIL: actual sum ${actualSum.toString()} does not match expected ${expectedSum.toString()}.`);
+      }
+
+      log(`Worker compute time: ${elapsedMs.toFixed(1)} ms`);
+      log(`Total setup + compute time: ${totalElapsedMs.toFixed(1)} ms`);
+
+      if (sizeMiB >= 8192) {
+        log("If this 8 GiB allocation succeeded, your browser/runtime supports the requested shared Wasm memory size on this machine.");
+      } else {
+        log("To test the 8 GiB single-memory question, rerun with 8192 MiB. If it fails, shard the dataset across multiple memories/buffers.");
+      }
+
+      cleanupWorkers();
+
+      if (normalizedHoldSeconds > 0) {
+        log(`Holding shared Wasm memory for ${normalizedHoldSeconds} second(s) for inspection...`);
+        await new Promise((resolve) => setTimeout(resolve, normalizedHoldSeconds * 1000));
+      }
+
+      startBtn.disabled = false;
+    }
+
+    startBtn.addEventListener("click", () => {
+      runTest().catch((error) => {
+        log(`Unhandled error: ${error.message || error}`);
+        startBtn.disabled = false;
+      });
+    });
+
+    resetBtn.addEventListener("click", resetAll);
+    sizeMiBInput.addEventListener("input", updateLimitStatus);
+
+    updateEnvStatus();
+    updateLimitStatus();
+    updateHeapMetric();
+    log("Ready. Run at 1024 MiB first to validate shared Wasm memory across workers.");
+    log("Then try 8192 MiB to test whether a single 8 GiB shared Wasm memory is available on this machine/browser.");
+  </script>
+</body>
+</html>

@@ -1,0 +1,703 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MVT 3a - Parquet → DuckDB-Wasm → Arrow → Sharded Memory Bank</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #121a33;
+      --panel-2: #0f1730;
+      --text: #e7ecff;
+      --muted: #a6b0d5;
+      --good: #66e3a4;
+      --warn: #ffd166;
+      --bad: #ff7b7b;
+      --border: #26345f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #0a0f1d, #0b1020 40%, #0d1327);
+      color: var(--text);
+    }
+    .wrap {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { margin: 8px 0; color: var(--muted); }
+    textarea, input, button {
+      width: 100%;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+    }
+    textarea { min-height: 120px; resize: vertical; }
+    button {
+      width: auto;
+      border: 0;
+      background: linear-gradient(180deg, #1c6fff, #1758cc);
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .secondary { background: #1a2447; border: 1px solid var(--border); }
+    .danger { background: linear-gradient(180deg, #c14444, #9e2f2f); }
+    .card {
+      background: rgba(18, 26, 51, .9);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      margin-top: 18px;
+      box-shadow: 0 8px 32px rgba(0,0,0,.22);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    .status {
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #101833;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
+    .status.good { border-color: rgba(102,227,164,.35); color: var(--good); }
+    .status.warn { border-color: rgba(255,209,102,.35); color: var(--warn); }
+    .status.bad { border-color: rgba(255,123,123,.35); color: var(--bad); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .metric {
+      background: #0e1630;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .metric .label {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .metric .value {
+      margin-top: 8px;
+      font-size: 22px;
+      font-weight: 800;
+    }
+    pre {
+      margin: 0;
+      background: #0b1228;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+      max-height: 360px;
+      color: #cfe0ff;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .small { font-size: 12px; color: var(--muted); }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    #fileInput { display: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>MVT 3a: Local Parquet → DuckDB-Wasm → Arrow → Sharded Memory Bank</h1>
+    <p>
+      This prototype tests the next architectural step: mounting a local Parquet file in DuckDB-Wasm,
+      streaming query results as Arrow <code>RecordBatch</code>es, routing each batch into a shared-memory
+      shard bank, and verifying that a worker can reconstruct Arrow bytes from the bank.
+    </p>
+
+    <div id="isolationStatus" class="status warn">Checking browser isolation requirements...</div>
+    <div id="duckdbStatus" class="status warn">DuckDB-Wasm not initialized yet.</div>
+    <div id="fileStatus" class="status warn">No Parquet file selected yet.</div>
+    <div id="verifyStatus" class="status warn">No worker verification run yet.</div>
+
+    <div class="card">
+      <strong>Setup</strong>
+      <div class="grid">
+        <label>
+          Shard size (MiB)
+          <input id="shardMiB" type="number" min="16" step="16" value="256" />
+        </label>
+        <label>
+          Target memory bank (GiB)
+          <input id="targetGiB" type="number" min="1" step="1" value="6" />
+        </label>
+        <label>
+          Max routed batches
+          <input id="maxBatches" type="number" min="1" step="1" value="32" />
+        </label>
+        <label>
+          Safety release shards on allocation failure
+          <input id="safetyRelease" type="number" min="0" step="1" value="2" />
+        </label>
+      </div>
+
+      <div class="row">
+        <button id="initBtn">1. Init DuckDB-Wasm</button>
+        <button id="pickFileBtn">2. Pick local .parquet</button>
+        <button id="allocateBtn">3. Allocate memory bank</button>
+        <button id="routeBtn">4. Route query result into bank</button>
+        <button id="verifyBtn" class="secondary">5. Verify first batch in worker</button>
+        <button id="releaseBtn" class="danger">Release memory</button>
+      </div>
+
+      <input id="fileInput" type="file" accept=".parquet,application/octet-stream" />
+    </div>
+
+    <div class="card">
+      <strong>SQL query</strong>
+      <textarea id="sqlInput">SELECT * FROM parquet_scan('selected.parquet') LIMIT 100000;</textarea>
+      <p class="small">
+        Start with a <code>LIMIT</code> while testing. If the route works, increase the query size.
+      </p>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="label">Allocated shards</div><div id="shardCountValue" class="value">0</div></div>
+      <div class="metric"><div class="label">Bank size</div><div id="bankSizeValue" class="value">0 B</div></div>
+      <div class="metric"><div class="label">Free space</div><div id="freeSpaceValue" class="value">0 B</div></div>
+      <div class="metric"><div class="label">Batches routed</div><div id="batchCountValue" class="value">0</div></div>
+      <div class="metric"><div class="label">Rows routed</div><div id="rowCountValue" class="value">0</div></div>
+      <div class="metric"><div class="label">Arrow bytes routed</div><div id="byteCountValue" class="value">0 B</div></div>
+      <div class="metric"><div class="label">Largest batch</div><div id="largestBatchValue" class="value">0 B</div></div>
+      <div class="metric"><div class="label">Chrome heap used*</div><div id="heapValue" class="value">-</div></div>
+    </div>
+
+    <div class="card">
+      <strong>Batch manifest</strong>
+      <pre id="manifest"></pre>
+      <p class="small">
+        Each manifest entry records where one Arrow IPC payload lives inside the shard bank.
+        If a batch crosses shard boundaries, multiple placements are listed.
+      </p>
+    </div>
+
+    <div class="card">
+      <strong>Log</strong>
+      <pre id="log"></pre>
+      <p class="small">
+        * This prototype proves the routing concept. It still performs a JS copy into the shared bank.
+        The next optimization step would be reducing copies and/or parsing Arrow directly inside workers/Wasm.
+      </p>
+    </div>
+  </div>
+
+  <script type="module">
+    const CDN_DUCKDB = 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@latest/+esm';
+    const CDN_ARROW = 'https://cdn.jsdelivr.net/npm/apache-arrow@latest/+esm';
+
+    const $ = (id) => document.getElementById(id);
+    const logEl = $('log');
+    const manifestEl = $('manifest');
+    const isolationStatusEl = $('isolationStatus');
+    const duckdbStatusEl = $('duckdbStatus');
+    const fileStatusEl = $('fileStatus');
+    const verifyStatusEl = $('verifyStatus');
+
+    const initBtn = $('initBtn');
+    const pickFileBtn = $('pickFileBtn');
+    const allocateBtn = $('allocateBtn');
+    const routeBtn = $('routeBtn');
+    const verifyBtn = $('verifyBtn');
+    const releaseBtn = $('releaseBtn');
+    const fileInput = $('fileInput');
+
+    const shardMiBInput = $('shardMiB');
+    const targetGiBInput = $('targetGiB');
+    const maxBatchesInput = $('maxBatches');
+    const safetyReleaseInput = $('safetyRelease');
+    const sqlInput = $('sqlInput');
+
+    let duckdb = null;
+    let arrow = null;
+    let db = null;
+    let conn = null;
+    let selectedFile = null;
+    let selectedHandle = null;
+    let registeredFileName = 'selected.parquet';
+    let shards = [];
+    let router = null;
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      logEl.textContent += `[${time}] ${message}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes)) return '-';
+      const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+      let value = bytes;
+      let unitIndex = 0;
+      while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex++;
+      }
+      return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[unitIndex]}`;
+    }
+
+    function formatNumber(value) {
+      if (!Number.isFinite(value)) return '-';
+      return new Intl.NumberFormat().format(value);
+    }
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function updateHeapMetric() {
+      if (performance.memory && Number.isFinite(performance.memory.usedJSHeapSize)) {
+        $('heapValue').textContent = formatBytes(performance.memory.usedJSHeapSize);
+      } else {
+        $('heapValue').textContent = 'n/a';
+      }
+    }
+
+    function updateIsolationStatus() {
+      if (window.crossOriginIsolated) {
+        isolationStatusEl.className = 'status good';
+        isolationStatusEl.textContent = 'crossOriginIsolated = true. SharedArrayBuffer is available.';
+      } else {
+        isolationStatusEl.className = 'status bad';
+        isolationStatusEl.textContent = [
+          'crossOriginIsolated = false. This page requires SharedArrayBuffer.',
+          'Serve with:',
+          'Cross-Origin-Opener-Policy: same-origin',
+          'Cross-Origin-Embedder-Policy: require-corp'
+        ].join('\n');
+      }
+    }
+
+    class ShardRouter {
+      constructor(shards) {
+        this.shards = shards;
+        this.cursorShard = 0;
+        this.cursorOffset = 0;
+        this.entries = [];
+        this.totalRoutedBytes = 0;
+        this.totalRows = 0;
+        this.largestBatchBytes = 0;
+      }
+
+      get totalCapacityBytes() {
+        return this.shards.reduce((sum, sab) => sum + sab.byteLength, 0);
+      }
+
+      get freeBytes() {
+        return this.totalCapacityBytes - this.totalRoutedBytes;
+      }
+
+      writeBytes(tag, bytes, meta = {}) {
+        if (bytes.byteLength > this.freeBytes) {
+          throw new Error(`Bank full: need ${formatBytes(bytes.byteLength)} but only ${formatBytes(this.freeBytes)} remain.`);
+        }
+
+        const placements = [];
+        let remaining = bytes.byteLength;
+        let sourceOffset = 0;
+
+        while (remaining > 0) {
+          if (this.cursorShard >= this.shards.length) {
+            throw new Error('Shard router exhausted all shards.');
+          }
+
+          const shard = this.shards[this.cursorShard];
+          const shardSpace = shard.byteLength - this.cursorOffset;
+          if (shardSpace <= 0) {
+            this.cursorShard++;
+            this.cursorOffset = 0;
+            continue;
+          }
+
+          const writeLength = Math.min(shardSpace, remaining);
+          new Uint8Array(shard, this.cursorOffset, writeLength).set(bytes.subarray(sourceOffset, sourceOffset + writeLength));
+          placements.push({ shardIndex: this.cursorShard, offset: this.cursorOffset, length: writeLength });
+          this.cursorOffset += writeLength;
+          sourceOffset += writeLength;
+          remaining -= writeLength;
+          this.totalRoutedBytes += writeLength;
+        }
+
+        this.totalRows += meta.rowCount || 0;
+        this.largestBatchBytes = Math.max(this.largestBatchBytes, bytes.byteLength);
+
+        const entry = {
+          id: this.entries.length,
+          tag,
+          byteLength: bytes.byteLength,
+          rowCount: meta.rowCount || 0,
+          schema: meta.schema || [],
+          placements,
+        };
+        this.entries.push(entry);
+        return entry;
+      }
+
+      readEntryBytes(entry) {
+        const output = new Uint8Array(entry.byteLength);
+        let destOffset = 0;
+        for (const placement of entry.placements) {
+          const src = new Uint8Array(this.shards[placement.shardIndex], placement.offset, placement.length);
+          output.set(src, destOffset);
+          destOffset += placement.length;
+        }
+        return output;
+      }
+    }
+
+    function updateMetrics() {
+      $('shardCountValue').textContent = formatNumber(shards.length);
+      $('bankSizeValue').textContent = formatBytes(router ? router.totalCapacityBytes : shards.reduce((sum, sab) => sum + sab.byteLength, 0));
+      $('freeSpaceValue').textContent = formatBytes(router ? router.freeBytes : shards.reduce((sum, sab) => sum + sab.byteLength, 0));
+      $('batchCountValue').textContent = formatNumber(router ? router.entries.length : 0);
+      $('rowCountValue').textContent = formatNumber(router ? router.totalRows : 0);
+      $('byteCountValue').textContent = formatBytes(router ? router.totalRoutedBytes : 0);
+      $('largestBatchValue').textContent = formatBytes(router ? router.largestBatchBytes : 0);
+      updateHeapMetric();
+      renderManifest();
+    }
+
+    function renderManifest() {
+      if (!router || router.entries.length === 0) {
+        manifestEl.textContent = 'No Arrow batches routed yet.';
+        return;
+      }
+      manifestEl.textContent = router.entries.map((entry) => {
+        const placements = entry.placements.map((p) => `shard ${p.shardIndex} @ ${formatNumber(p.offset)} + ${formatNumber(p.length)}B`).join('; ');
+        const schema = entry.schema.join(', ');
+        return `batch ${entry.id}: rows=${formatNumber(entry.rowCount)}, bytes=${formatBytes(entry.byteLength)}, schema=[${schema}]\n  ${placements}`;
+      }).join('\n\n');
+    }
+
+    async function initDuckDB() {
+      if (db && conn) {
+        duckdbStatusEl.className = 'status good';
+        duckdbStatusEl.textContent = 'DuckDB-Wasm already initialized.';
+        return;
+      }
+
+      duckdbStatusEl.className = 'status warn';
+      duckdbStatusEl.textContent = 'Loading DuckDB-Wasm and Apache Arrow modules...';
+      log('Importing DuckDB-Wasm and Apache Arrow from CDN...');
+      duckdb = await import(CDN_DUCKDB);
+      arrow = await import(CDN_ARROW);
+
+      const bundles = duckdb.getJsDelivrBundles();
+      const bundle = await duckdb.selectBundle(bundles);
+      const worker = await duckdb.createWorker(bundle.mainWorker);
+      db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(), worker);
+      await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+      conn = await db.connect();
+
+      duckdbStatusEl.className = 'status good';
+      duckdbStatusEl.textContent = 'DuckDB-Wasm initialized and ready.';
+      log('DuckDB-Wasm initialized successfully.');
+    }
+
+    async function pickParquetFile() {
+      if (!db) {
+        await initDuckDB();
+      }
+
+      selectedFile = null;
+      selectedHandle = null;
+
+      if (window.showOpenFilePicker) {
+        const [handle] = await window.showOpenFilePicker({
+          multiple: false,
+          types: [{
+            description: 'Parquet files',
+            accept: {
+              'application/octet-stream': ['.parquet'],
+              'application/x-parquet': ['.parquet']
+            }
+          }]
+        });
+        if (!handle) return;
+        selectedHandle = handle;
+        selectedFile = await handle.getFile();
+      } else {
+        fileInput.value = '';
+        fileInput.click();
+        await new Promise((resolve, reject) => {
+          fileInput.onchange = () => fileInput.files?.[0] ? resolve() : reject(new Error('No file selected'));
+        });
+        selectedFile = fileInput.files[0];
+      }
+
+      if (!selectedFile) {
+        throw new Error('No file selected.');
+      }
+
+      try {
+        await db.dropFile?.(registeredFileName);
+      } catch {}
+
+      try {
+        await db.registerFileHandle(registeredFileName, selectedFile, duckdb.DuckDBDataProtocol.BROWSER_FILEREADER, true);
+        log(`Registered ${selectedFile.name} via FileReader-backed file handle.`);
+      } catch (error) {
+        if (selectedHandle && duckdb.DuckDBDataProtocol?.BROWSER_FSACCESS !== undefined) {
+          log(`FileReader registration failed (${error.message}). Trying File System Access handle fallback...`);
+          await db.registerFileHandle(registeredFileName, selectedHandle, duckdb.DuckDBDataProtocol.BROWSER_FSACCESS, true);
+          log(`Registered ${selectedFile.name} via File System Access handle fallback.`);
+        } else {
+          throw error;
+        }
+      }
+
+      sqlInput.value = `SELECT * FROM parquet_scan('${registeredFileName}') LIMIT 100000;`;
+      fileStatusEl.className = 'status good';
+      fileStatusEl.textContent = `Selected file: ${selectedFile.name} (${formatBytes(selectedFile.size)}). Registered as ${registeredFileName}.`;
+    }
+
+    async function allocateBank() {
+      if (!window.crossOriginIsolated) {
+        updateIsolationStatus();
+        throw new Error('SharedArrayBuffer unavailable.');
+      }
+
+      const shardMiB = Number(shardMiBInput.value);
+      const targetGiB = Number(targetGiBInput.value);
+      const safetyRelease = Math.trunc(Number(safetyReleaseInput.value));
+
+      if (!Number.isFinite(shardMiB) || shardMiB <= 0) throw new Error('Invalid shard size.');
+      if (!Number.isFinite(targetGiB) || targetGiB <= 0) throw new Error('Invalid target bank size.');
+      if (!Number.isFinite(safetyRelease) || safetyRelease < 0) throw new Error('Invalid safety release.');
+
+      const shardBytes = shardMiB * 1024 * 1024;
+      const targetBytes = targetGiB * 1024 * 1024 * 1024;
+
+      shards = [];
+      router = null;
+      updateMetrics();
+      log(`Allocating shard bank: ${targetGiB} GiB target with ${shardMiB} MiB shards...`);
+
+      while (shards.reduce((sum, sab) => sum + sab.byteLength, 0) < targetBytes) {
+        try {
+          const sab = new SharedArrayBuffer(shardBytes);
+          const touch = new Uint8Array(sab);
+          for (let i = 0; i < touch.length; i += 4096) touch[i] = (touch[i] + 1) & 0xff;
+          if (touch.length) touch[touch.length - 1] = (touch[touch.length - 1] + 1) & 0xff;
+          shards.push(sab);
+          updateMetrics();
+          await sleep(20);
+        } catch (error) {
+          log(`Allocation failed after ${shards.length} shard(s): ${error.message}`);
+          if (safetyRelease > 0) {
+            const count = Math.min(safetyRelease, shards.length);
+            for (let i = 0; i < count; i++) shards.pop();
+            log(`Safety release removed ${count} shard(s).`);
+          }
+          throw error;
+        }
+      }
+
+      router = new ShardRouter(shards);
+      updateMetrics();
+      log(`Memory bank ready: ${formatBytes(router.totalCapacityBytes)} across ${shards.length} shard(s).`);
+    }
+
+    function batchToColumnArrays(batch) {
+      const columns = {};
+      for (let index = 0; index < batch.schema.fields.length; index++) {
+        const field = batch.schema.fields[index];
+        const vector = typeof batch.getChildAt === 'function'
+          ? batch.getChildAt(index)
+          : typeof batch.getChild === 'function'
+            ? batch.getChild(field.name)
+            : null;
+
+        if (!vector) {
+          throw new Error(`Unable to access column vector for field ${field.name}`);
+        }
+
+        if (typeof vector.toArray === 'function') {
+          columns[field.name] = vector.toArray();
+          continue;
+        }
+
+        const values = new Array(batch.numRows);
+        for (let row = 0; row < batch.numRows; row++) {
+          values[row] = typeof vector.get === 'function' ? vector.get(row) : batch.getChildAt(index).get(row);
+        }
+        columns[field.name] = values;
+      }
+      return columns;
+    }
+
+    function recordBatchToIPCBytes(batch) {
+      const columns = batchToColumnArrays(batch);
+      const table = arrow.tableFromArrays(columns);
+      return arrow.tableToIPC(table, 'stream');
+    }
+
+    async function routeQuery() {
+      if (!conn) throw new Error('DuckDB-Wasm is not initialized.');
+      if (!selectedFile) throw new Error('No Parquet file selected.');
+      if (!router) throw new Error('Memory bank not allocated.');
+
+      const maxBatches = Number(maxBatchesInput.value);
+      if (!Number.isFinite(maxBatches) || maxBatches <= 0) throw new Error('Invalid max batch count.');
+
+      router = new ShardRouter(shards);
+      updateMetrics();
+      verifyStatusEl.className = 'status warn';
+      verifyStatusEl.textContent = 'No worker verification run yet.';
+
+      const sql = sqlInput.value.trim();
+      if (!sql) throw new Error('SQL query is empty.');
+
+      log(`Running DuckDB query as Arrow stream...`);
+      log(sql);
+
+      let batchIndex = 0;
+      const reader = await conn.send(sql);
+      for await (const batch of reader) {
+        if (batchIndex >= maxBatches) {
+          log(`Reached configured max batch count (${maxBatches}). Stopping stream consumption.`);
+          break;
+        }
+
+        const schema = batch.schema.fields.map((field) => `${field.name}:${field.type}`);
+        let bytes;
+        try {
+          bytes = recordBatchToIPCBytes(batch);
+        } catch (error) {
+          log(`Batch ${batchIndex} serialization failed: ${error.message}`);
+          throw error;
+        }
+        const entry = router.writeBytes(`batch-${batchIndex}`, bytes, {
+          rowCount: batch.numRows,
+          schema,
+        });
+
+        batchIndex++;
+        log(`Routed batch ${entry.id}: rows=${formatNumber(batch.numRows)}, ipc=${formatBytes(bytes.byteLength)}, placements=${entry.placements.length}.`);
+        updateMetrics();
+      }
+
+      log(`Routing complete. Stored ${router.entries.length} batch(es), ${formatNumber(router.totalRows)} row(s), ${formatBytes(router.totalRoutedBytes)} Arrow bytes.`);
+      updateMetrics();
+    }
+
+    async function verifyFirstBatchInWorker() {
+      if (!router || router.entries.length === 0) {
+        throw new Error('No routed batch is available for verification.');
+      }
+
+      const entry = router.entries[0];
+      verifyStatusEl.className = 'status warn';
+      verifyStatusEl.textContent = 'Verifying first routed batch inside a worker...';
+
+      const source = `
+        self.onmessage = async (event) => {
+          try {
+            const arrow = await import('${CDN_ARROW}');
+            const { shards, entry } = event.data;
+            const bytes = new Uint8Array(entry.byteLength);
+            let destOffset = 0;
+            for (const placement of entry.placements) {
+              const src = new Uint8Array(shards[placement.shardIndex], placement.offset, placement.length);
+              bytes.set(src, destOffset);
+              destOffset += placement.length;
+            }
+            const table = arrow.tableFromIPC(bytes);
+            const fields = table.schema.fields.map((field) => ({ name: field.name, type: String(field.type) }));
+            self.postMessage({
+              ok: true,
+              rowCount: table.numRows,
+              fieldCount: fields.length,
+              fields,
+              byteLength: bytes.byteLength
+            });
+          } catch (error) {
+            self.postMessage({ ok: false, error: error.message || String(error) });
+          }
+        };
+      `;
+
+      const worker = new Worker(URL.createObjectURL(new Blob([source], { type: 'text/javascript' })), { type: 'module' });
+      const result = await new Promise((resolve, reject) => {
+        worker.onmessage = (event) => resolve(event.data);
+        worker.onerror = (error) => reject(error);
+        worker.postMessage({ shards, entry });
+      }).finally(() => worker.terminate());
+
+      if (!result.ok) {
+        verifyStatusEl.className = 'status bad';
+        verifyStatusEl.textContent = `Worker verification failed: ${result.error}`;
+        throw new Error(result.error);
+      }
+
+      verifyStatusEl.className = 'status good';
+      verifyStatusEl.textContent = `Worker verified first batch: ${formatNumber(result.rowCount)} row(s), ${result.fieldCount} field(s), ${formatBytes(result.byteLength)} reconstructed.`;
+      log(`Worker verification succeeded for batch 0: rows=${result.rowCount}, fields=${result.fields.map((f) => `${f.name}:${f.type}`).join(', ')}.`);
+    }
+
+    async function releaseAll() {
+      shards = [];
+      router = null;
+      updateMetrics();
+      log('Released shard bank references.');
+    }
+
+    initBtn.addEventListener('click', () => {
+      initDuckDB().catch((error) => {
+        duckdbStatusEl.className = 'status bad';
+        duckdbStatusEl.textContent = `DuckDB init failed: ${error.message}`;
+        log(`DuckDB init failed: ${error.message}`);
+      });
+    });
+
+    pickFileBtn.addEventListener('click', () => {
+      pickParquetFile().catch((error) => {
+        fileStatusEl.className = 'status bad';
+        fileStatusEl.textContent = `File selection/registration failed: ${error.message}`;
+        log(`File pick/register failed: ${error.message}`);
+      });
+    });
+
+    allocateBtn.addEventListener('click', () => {
+      allocateBank().catch((error) => log(`Allocation failed: ${error.message}`));
+    });
+
+    routeBtn.addEventListener('click', () => {
+      routeQuery().catch((error) => log(`Routing failed: ${error.message}`));
+    });
+
+    verifyBtn.addEventListener('click', () => {
+      verifyFirstBatchInWorker().catch((error) => log(`Verification failed: ${error.message}`));
+    });
+
+    releaseBtn.addEventListener('click', () => {
+      releaseAll().catch((error) => log(`Release failed: ${error.message}`));
+    });
+
+    updateIsolationStatus();
+    updateMetrics();
+    renderManifest();
+    log('Ready. Init DuckDB-Wasm, pick a Parquet file, allocate the bank, route query batches, then verify batch reconstruction in a worker.');
+  </script>
+</body>
+</html>

@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Polars Shard-Bank Bridge Spike</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #121a33;
+      --panel-2: #0f1730;
+      --text: #e7ecff;
+      --muted: #a6b0d5;
+      --good: #66e3a4;
+      --warn: #ffd166;
+      --bad: #ff7b7b;
+      --border: #26345f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #0a0f1d, #0b1020 40%, #0d1327);
+      color: var(--text);
+    }
+    .wrap { max-width: 1120px; margin: 0 auto; padding: 32px 20px 48px; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { margin: 8px 0; color: var(--muted); }
+    .card {
+      background: rgba(18, 26, 51, 0.9);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      margin-top: 18px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.22);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    input, button {
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+    }
+    button {
+      border: 0;
+      background: linear-gradient(180deg, #1c6fff, #1758cc);
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .secondary { background: #1a2447; border: 1px solid var(--border); }
+    .danger { background: linear-gradient(180deg, #c14444, #9e2f2f); }
+    .status {
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #101833;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
+    .status.good { border-color: rgba(102, 227, 164, .35); color: var(--good); }
+    .status.warn { border-color: rgba(255, 209, 102, .35); color: var(--warn); }
+    .status.bad { border-color: rgba(255, 123, 123, .35); color: var(--bad); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .metric {
+      background: #0e1630;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .metric .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .metric .value { margin-top: 8px; font-size: 22px; font-weight: 800; }
+    pre {
+      margin: 0;
+      background: #0b1228;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+      max-height: 360px;
+      color: #cfe0ff;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .small { font-size: 12px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Polars Shard-Bank Bridge Spike</h1>
+    <p>
+      This experiment allocates a shared <code>WebAssembly.Memory</code> shard bank, writes realistic typed columns into it, then copies those segmented columns into a Polars-owned Wasm memory region and measures the bridge cost plus Polars compute cost.
+    </p>
+
+    <div id="status" class="status warn">Polars wasm not loaded yet.</div>
+
+    <div class="card">
+      <strong>Bridge setup</strong>
+      <div class="grid">
+        <label>
+          Rows
+          <input id="rowsInput" type="number" min="1" step="1000000" value="10000000" />
+        </label>
+        <label>
+          Shard size (MiB)
+          <input id="shardMiBInput" type="number" min="16" step="16" value="64" />
+        </label>
+        <label>
+          Target bank (MiB)
+          <input id="targetMiBInput" type="number" min="64" step="64" value="1024" />
+        </label>
+      </div>
+      <div class="row">
+        <button id="loadBtn">1. Load Polars wasm</button>
+        <button id="allocBtn" class="secondary">2. Allocate shard bank</button>
+        <button id="runBtn" disabled>3. Run shard-bank bridge test</button>
+        <button id="releaseBtn" class="danger">Release bank</button>
+      </div>
+      <p class="small">
+        This is still a copy bridge into Polars memory. The point is to measure whether Polars remains practical after reconstructing segmented typed columns from the bank.
+      </p>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="label">Wasm size</div><div id="wasmSizeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Load/init time</div><div id="loadTimeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Bank size</div><div id="bankSizeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Fill time</div><div id="fillTimeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Bridge copy time</div><div id="bridgeCopyTimeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Polars compute time</div><div id="computeTimeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Total run time</div><div id="totalTimeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Polars sum</div><div id="polarsSumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">JS sum</div><div id="jsSumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Polars label1 count</div><div id="polarsCountValue" class="value">-</div></div>
+      <div class="metric"><div class="label">JS label1 count</div><div id="jsCountValue" class="value">-</div></div>
+    </div>
+
+    <div class="card">
+      <strong>Segment manifest</strong>
+      <pre id="manifest"></pre>
+    </div>
+
+    <div class="card">
+      <strong>Result</strong>
+      <pre id="result"></pre>
+    </div>
+
+    <div class="card">
+      <strong>Log</strong>
+      <pre id="log"></pre>
+    </div>
+  </div>
+
+  <script type="module">
+    import initPolars from './polars-web/polars_spike.js';
+
+    const $ = (id) => document.getElementById(id);
+    const statusEl = $('status');
+    const logEl = $('log');
+    const resultEl = $('result');
+    const manifestEl = $('manifest');
+    const loadBtn = $('loadBtn');
+    const allocBtn = $('allocBtn');
+    const runBtn = $('runBtn');
+    const releaseBtn = $('releaseBtn');
+    const rowsInput = $('rowsInput');
+    const shardMiBInput = $('shardMiBInput');
+    const targetMiBInput = $('targetMiBInput');
+
+    let polars = null;
+    let bank = [];
+    let router = null;
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      logEl.textContent += `[${time}] ${message}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes)) return '-';
+      const units = ['B', 'KiB', 'MiB', 'GiB'];
+      let value = bytes;
+      let index = 0;
+      while (value >= 1024 && index < units.length - 1) {
+        value /= 1024;
+        index++;
+      }
+      return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[index]}`;
+    }
+
+    function formatNumber(value, digits = 2) {
+      if (!Number.isFinite(value)) return '-';
+      return new Intl.NumberFormat(undefined, {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: digits,
+      }).format(value);
+    }
+
+    function setStatus(kind, text) {
+      statusEl.className = `status ${kind}`;
+      statusEl.textContent = text;
+    }
+
+    class SegmentRouter {
+      constructor(memories) {
+        this.memories = memories;
+        this.shardIndex = 0;
+        this.offset = 0;
+        this.segments = [];
+      }
+
+      align(alignment) {
+        const rem = this.offset % alignment;
+        if (rem !== 0) this.offset += alignment - rem;
+      }
+
+      writeTypedArray(name, typedArray, alignment) {
+        this.align(alignment);
+        let remainingBytes = typedArray.byteLength;
+        let sourceByteOffset = 0;
+        const placements = [];
+
+        while (remainingBytes > 0) {
+          if (this.shardIndex >= this.memories.length) throw new Error('Out of shards');
+          const buffer = this.memories[this.shardIndex].buffer;
+          const space = buffer.byteLength - this.offset;
+          if (space <= 0) {
+            this.shardIndex++;
+            this.offset = 0;
+            continue;
+          }
+          const writeLength = Math.min(space, remainingBytes);
+          const destination = new Uint8Array(buffer, this.offset, writeLength);
+          const source = new Uint8Array(typedArray.buffer, typedArray.byteOffset + sourceByteOffset, writeLength);
+          destination.set(source);
+          placements.push({ shardIndex: this.shardIndex, offset: this.offset, byteLength: writeLength });
+          this.offset += writeLength;
+          sourceByteOffset += writeLength;
+          remainingBytes -= writeLength;
+        }
+
+        const entry = {
+          name,
+          type: typedArray.constructor.name,
+          length: typedArray.length,
+          byteLength: typedArray.byteLength,
+          placements,
+        };
+        this.segments.push(entry);
+        return entry;
+      }
+    }
+
+    function renderManifest() {
+      if (!router || router.segments.length === 0) {
+        manifestEl.textContent = 'No routed typed segments yet.';
+        return;
+      }
+      manifestEl.textContent = router.segments.map((segment) => {
+        const placements = segment.placements.map((p) => `shard ${p.shardIndex} @ ${p.offset} + ${p.byteLength}`).join('; ');
+        return `${segment.name}: ${segment.type}, length=${segment.length}, bytes=${segment.byteLength}\n  ${placements}`;
+      }).join('\n\n');
+    }
+
+    function jsReference(rows) {
+      let sum = 0;
+      let label1Count = 0;
+      let partition0Count = 0;
+      let partition1Count = 0;
+      for (let i = 0; i < rows; i++) {
+        const value = ((i % 1000) * 0.5) - 100.0;
+        const label = (i % 3 === 0 || i % 5 === 0) ? 1 : 0;
+        const partition = i % 8;
+        if (partition === 0) partition0Count++;
+        else if (partition === 1) partition1Count++;
+        if (label === 1) {
+          sum += value;
+          label1Count++;
+        }
+      }
+      return { sum, label1Count, partition0Count, partition1Count };
+    }
+
+    async function loadPolars() {
+      setStatus('warn', 'Loading Polars wasm...');
+      const startedAt = performance.now();
+      const response = await fetch('./polars-web/polars_spike_bg.wasm');
+      const wasmBytes = await response.arrayBuffer();
+      $('wasmSizeValue').textContent = formatBytes(wasmBytes.byteLength);
+      polars = await initPolars(wasmBytes);
+      const endedAt = performance.now();
+      $('loadTimeValue').textContent = `${(endedAt - startedAt).toFixed(1)} ms`;
+      setStatus('good', 'Polars wasm loaded successfully.');
+      runBtn.disabled = false;
+      log(`Loaded Polars wasm (${formatBytes(wasmBytes.byteLength)}) in ${(endedAt - startedAt).toFixed(1)} ms.`);
+    }
+
+    function allocateBank() {
+      const shardMiB = Math.trunc(Number(shardMiBInput.value));
+      const targetMiB = Math.trunc(Number(targetMiBInput.value));
+      if (!Number.isFinite(shardMiB) || shardMiB <= 0) throw new Error('Invalid shard size');
+      if (!Number.isFinite(targetMiB) || targetMiB <= 0) throw new Error('Invalid target bank size');
+      const shardBytes = shardMiB * 1024 * 1024;
+      const targetBytes = targetMiB * 1024 * 1024;
+      if (shardBytes % 65536 !== 0) throw new Error('Shard size must align to 64 KiB wasm pages');
+      const pages = shardBytes / 65536;
+      bank = [];
+      while (bank.reduce((sum, memory) => sum + memory.buffer.byteLength, 0) < targetBytes) {
+        bank.push(new WebAssembly.Memory({ shared: true, initial: pages, maximum: pages }));
+      }
+      router = new SegmentRouter(bank);
+      $('bankSizeValue').textContent = formatBytes(bank.reduce((sum, memory) => sum + memory.buffer.byteLength, 0));
+      renderManifest();
+      log(`Allocated ${bank.length} shared wasm-memory shard(s).`);
+      setStatus('good', 'Shared shard bank allocated.');
+    }
+
+    function reconstructIntoPolarsMemory(entry, allocFn, ArrayType) {
+      const ptr = allocFn(entry.length);
+      const target = new ArrayType(polars.memory.buffer, ptr, entry.length);
+      let destByteOffset = 0;
+      for (const placement of entry.placements) {
+        const src = new Uint8Array(bank[placement.shardIndex].buffer, placement.offset, placement.byteLength);
+        const dst = new Uint8Array(target.buffer, target.byteOffset + destByteOffset, placement.byteLength);
+        dst.set(src);
+        destByteOffset += placement.byteLength;
+      }
+      return ptr;
+    }
+
+    function runBridgeTest() {
+      if (!polars) throw new Error('Polars wasm not loaded.');
+      if (!router) throw new Error('Shard bank not allocated.');
+
+      const rows = Math.trunc(Number(rowsInput.value));
+      if (!Number.isFinite(rows) || rows <= 0) throw new Error('Invalid row count');
+
+      setStatus('warn', `Running shard-bank bridge test for ${rows.toLocaleString()} rows...`);
+
+      const fillStartedAt = performance.now();
+      const featureA = new Float64Array(rows);
+      const label = new Int32Array(rows);
+      const partition = new Int32Array(rows);
+      for (let i = 0; i < rows; i++) {
+        featureA[i] = ((i % 1000) * 0.5) - 100.0;
+        label[i] = (i % 3 === 0 || i % 5 === 0) ? 1 : 0;
+        partition[i] = i % 8;
+      }
+      router = new SegmentRouter(bank);
+      const featureEntry = router.writeTypedArray('feature_a', featureA, 8);
+      const labelEntry = router.writeTypedArray('label', label, 4);
+      const partitionEntry = router.writeTypedArray('partition', partition, 4);
+      const fillEndedAt = performance.now();
+      $('fillTimeValue').textContent = `${(fillEndedAt - fillStartedAt).toFixed(1)} ms`;
+      renderManifest();
+
+      const bridgeStartedAt = performance.now();
+      const featurePtr = reconstructIntoPolarsMemory(featureEntry, polars.polars_alloc_f64_buffer, Float64Array);
+      const labelPtr = reconstructIntoPolarsMemory(labelEntry, polars.polars_alloc_i32_buffer, Int32Array);
+      const partitionPtr = reconstructIntoPolarsMemory(partitionEntry, polars.polars_alloc_i32_buffer, Int32Array);
+      const bridgeEndedAt = performance.now();
+      $('bridgeCopyTimeValue').textContent = `${(bridgeEndedAt - bridgeStartedAt).toFixed(1)} ms`;
+
+      const computeStartedAt = performance.now();
+      const polarsSum = polars.polars_from_buffers(featurePtr, labelPtr, partitionPtr, rows);
+      const polarsLabel1Count = polars.polars_last_label1_count();
+      const partition0Count = polars.polars_last_partition0_count();
+      const partition1Count = polars.polars_last_partition1_count();
+      const computeEndedAt = performance.now();
+      $('computeTimeValue').textContent = `${(computeEndedAt - computeStartedAt).toFixed(1)} ms`;
+      $('totalTimeValue').textContent = `${(computeEndedAt - fillStartedAt).toFixed(1)} ms`;
+
+      const js = jsReference(rows);
+      $('polarsSumValue').textContent = formatNumber(polarsSum, 4);
+      $('jsSumValue').textContent = formatNumber(js.sum, 4);
+      $('polarsCountValue').textContent = formatNumber(polarsLabel1Count, 0);
+      $('jsCountValue').textContent = formatNumber(js.label1Count, 0);
+
+      const success =
+        Math.abs(polarsSum - js.sum) <= 1e-6 * Math.max(1, Math.abs(js.sum)) &&
+        polarsLabel1Count === js.label1Count &&
+        partition0Count === js.partition0Count &&
+        partition1Count === js.partition1Count;
+
+      resultEl.textContent = JSON.stringify({
+        rows,
+        bankBytes: bank.reduce((sum, memory) => sum + memory.buffer.byteLength, 0),
+        routedBytes: featureEntry.byteLength + labelEntry.byteLength + partitionEntry.byteLength,
+        fillMs: fillEndedAt - fillStartedAt,
+        bridgeCopyMs: bridgeEndedAt - bridgeStartedAt,
+        polarsComputeMs: computeEndedAt - computeStartedAt,
+        totalMs: computeEndedAt - fillStartedAt,
+        polarsSum,
+        jsSum: js.sum,
+        polarsLabel1Count,
+        jsLabel1Count: js.label1Count,
+        partition0Count,
+        jsPartition0Count: js.partition0Count,
+        partition1Count,
+        jsPartition1Count: js.partition1Count,
+        success,
+      }, null, 2);
+
+      if (success) {
+        setStatus('good', `Polars shard-bank bridge test passed for ${rows.toLocaleString()} rows.`);
+      } else {
+        setStatus('bad', 'Polars shard-bank bridge mismatch.');
+      }
+      log(`Shard-bank bridge test: rows=${rows}, fill=${(fillEndedAt - fillStartedAt).toFixed(1)} ms, bridge=${(bridgeEndedAt - bridgeStartedAt).toFixed(1)} ms, compute=${(computeEndedAt - computeStartedAt).toFixed(1)} ms, success=${success}`);
+    }
+
+    function releaseBank() {
+      bank = [];
+      router = null;
+      manifestEl.textContent = 'No routed typed segments yet.';
+      setStatus('warn', 'Shard bank released.');
+      log('Released shard bank.');
+    }
+
+    loadBtn.addEventListener('click', () => {
+      loadPolars().catch((error) => {
+        setStatus('bad', `Load failed: ${error.message}`);
+        log(`Load failed: ${error.message}`);
+      });
+    });
+
+    allocBtn.addEventListener('click', () => {
+      try {
+        allocateBank();
+      } catch (error) {
+        setStatus('bad', `Allocation failed: ${error.message}`);
+        log(`Allocation failed: ${error.message}`);
+      }
+    });
+
+    runBtn.addEventListener('click', () => {
+      try {
+        runBridgeTest();
+      } catch (error) {
+        setStatus('bad', `Bridge test failed: ${error.message}`);
+        log(`Bridge test failed: ${error.message}`);
+      }
+    });
+
+    releaseBtn.addEventListener('click', () => {
+      releaseBank();
+    });
+
+    manifestEl.textContent = 'No routed typed segments yet.';
+    resultEl.textContent = 'No result yet.';
+    log('Ready. Load Polars wasm, allocate the shard bank, then run the shard-bank bridge test.');
+  </script>
+</body>
+</html>

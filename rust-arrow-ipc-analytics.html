@@ -1,0 +1,760 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MVT 3e - Rust Arrow IPC Parsing over Zero-Copy Shard Bank</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #121a33;
+      --panel-2: #0f1730;
+      --text: #e7ecff;
+      --muted: #a6b0d5;
+      --good: #66e3a4;
+      --warn: #ffd166;
+      --bad: #ff7b7b;
+      --border: #26345f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #0a0f1d, #0b1020 40%, #0d1327);
+      color: var(--text);
+    }
+    .wrap { max-width: 1220px; margin: 0 auto; padding: 32px 20px 48px; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { margin: 8px 0; color: var(--muted); }
+    textarea, input, button {
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+    }
+    textarea { width: 100%; min-height: 110px; resize: vertical; }
+    button { border: 0; background: linear-gradient(180deg, #1c6fff, #1758cc); font-weight: 700; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .secondary { background: #1a2447; border: 1px solid var(--border); }
+    .danger { background: linear-gradient(180deg, #c14444, #9e2f2f); }
+    .card {
+      background: rgba(18, 26, 51, .9);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      margin-top: 18px;
+      box-shadow: 0 8px 32px rgba(0,0,0,.22);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    .status {
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #101833;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
+    .status.good { border-color: rgba(102, 227, 164, .35); color: var(--good); }
+    .status.warn { border-color: rgba(255, 209, 102, .35); color: var(--warn); }
+    .status.bad { border-color: rgba(255, 123, 123, .35); color: var(--bad); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .metric {
+      background: #0e1630;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .metric .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .metric .value { margin-top: 8px; font-size: 22px; font-weight: 800; }
+    pre {
+      margin: 0;
+      background: #0b1228;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+      max-height: 360px;
+      color: #cfe0ff;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .small { font-size: 12px; color: var(--muted); }
+    #fileInput { display: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>MVT 3e: Rust Arrow IPC Parsing over the Zero-Copy Shard Bank</h1>
+    <p>
+      This prototype routes Arrow IPC batches into a shared <code>WebAssembly.Memory</code> shard bank, then uses
+      4 Rust/Wasm workers with the Rust Arrow IPC reader to parse those batches <em>directly from the imported shard memory</em>
+      and compute real aggregates.
+    </p>
+
+    <div id="isolationStatus" class="status warn">Checking browser requirements...</div>
+    <div id="duckdbStatus" class="status warn">DuckDB-Wasm not initialized yet.</div>
+    <div id="rustStatus" class="status warn">Rust Arrow IPC module not loaded yet.</div>
+    <div id="fileStatus" class="status warn">No Parquet file selected yet.</div>
+    <div id="proofStatus" class="status warn">Rust Arrow proof not started yet.</div>
+
+    <div class="card">
+      <strong>Setup</strong>
+      <div class="grid">
+        <label>
+          Shard size (MiB)
+          <input id="shardMiB" type="number" min="16" step="16" value="256" />
+        </label>
+        <label>
+          Target memory bank (GiB)
+          <input id="targetGiB" type="number" min="1" step="1" value="12" />
+        </label>
+        <label>
+          Rust worker count
+          <input id="workerCount" type="number" min="1" max="32" step="1" value="4" />
+        </label>
+        <label>
+          Max routed batches (0 = no limit)
+          <input id="maxBatches" type="number" min="0" step="1" value="0" />
+        </label>
+        <label>
+          Proof batch cap (0 = all routed batches)
+          <input id="proofBatchCap" type="number" min="0" step="100" value="1000" />
+        </label>
+        <label>
+          Safety release shards on allocation failure
+          <input id="safetyRelease" type="number" min="0" step="1" value="2" />
+        </label>
+      </div>
+
+      <div class="row">
+        <button id="initDuckdbBtn">1. Init DuckDB-Wasm</button>
+        <button id="initRustBtn">2. Load Rust Arrow module</button>
+        <button id="pickFileBtn">3. Pick local .parquet</button>
+        <button id="allocateBtn">4. Allocate 12 GiB wasm bank</button>
+        <button id="routeBtn">5. Route Arrow IPC into bank</button>
+        <button id="proveBtn" class="secondary" disabled>6. Run Rust Arrow proof</button>
+        <button id="releaseBtn" class="danger">Release memory</button>
+      </div>
+      <input id="fileInput" type="file" accept=".parquet,application/octet-stream" />
+    </div>
+
+    <div class="card">
+      <strong>Query used for routing</strong>
+      <textarea id="sqlInput">SELECT feature_a, feature_b, feature_c, label FROM parquet_scan('selected.parquet');</textarea>
+      <p class="small">
+        This proof currently requires each routed Arrow batch to fit contiguously inside a single shard. With 256 MiB shards and the default query, that condition holds comfortably.
+      </p>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="label">Allocated shards</div><div id="shardCountValue" class="value">0</div></div>
+      <div class="metric"><div class="label">Bank size</div><div id="bankSizeValue" class="value">0 B</div></div>
+      <div class="metric"><div class="label">Free space</div><div id="freeSpaceValue" class="value">0 B</div></div>
+      <div class="metric"><div class="label">Batches routed</div><div id="batchCountValue" class="value">0</div></div>
+      <div class="metric"><div class="label">Rows routed</div><div id="rowCountValue" class="value">0</div></div>
+      <div class="metric"><div class="label">Arrow bytes routed</div><div id="byteCountValue" class="value">0 B</div></div>
+      <div class="metric"><div class="label">Route time</div><div id="routeTimeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Rust proof time</div><div id="proofTimeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Proof batches</div><div id="proofBatchesValue" class="value">0</div></div>
+      <div class="metric"><div class="label">Workers completed</div><div id="workersDoneValue" class="value">0</div></div>
+      <div class="metric"><div class="label">Chrome heap used*</div><div id="heapValue" class="value">-</div></div>
+    </div>
+
+    <div class="card">
+      <strong>Worker progress</strong>
+      <pre id="workerProgressSummary">No worker progress yet.</pre>
+      <p class="small">
+        Use a proof batch cap for faster validation. Increase toward all batches once subset runs are stable.
+      </p>
+    </div>
+
+    <div class="card">
+      <strong>Result comparison</strong>
+      <pre id="resultSummary"></pre>
+      <p class="small">
+        Success means the distributed Rust Arrow IPC aggregate matches the DuckDB reference aggregate within a tight floating-point tolerance.
+      </p>
+    </div>
+
+    <div class="card">
+      <strong>Log</strong>
+      <pre id="log"></pre>
+      <p class="small">
+        * The Rust Arrow module was compiled with nightly <code>build-std</code> so that shared-memory Wasm with <code>std</code>-based Arrow IPC parsing is possible.
+      </p>
+    </div>
+  </div>
+
+  <script type="module">
+    const DUCKDB_CDN = 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@latest/+esm';
+    const ARROW_CDN = 'https://cdn.jsdelivr.net/npm/apache-arrow@latest/+esm';
+    const RUST_WASM_URL = './wasm/rust_arrow_ipc.wasm';
+
+    const $ = (id) => document.getElementById(id);
+    const logEl = $('log');
+    const resultSummaryEl = $('resultSummary');
+    const workerProgressSummaryEl = $('workerProgressSummary');
+    const isolationStatusEl = $('isolationStatus');
+    const duckdbStatusEl = $('duckdbStatus');
+    const rustStatusEl = $('rustStatus');
+    const fileStatusEl = $('fileStatus');
+    const proofStatusEl = $('proofStatus');
+    const fileInput = $('fileInput');
+
+    let duckdb = null;
+    let arrow = null;
+    let db = null;
+    let conn = null;
+    let rustWasmBytes = null;
+    let selectedFile = null;
+    let selectedHandle = null;
+    let memories = [];
+    let router = null;
+    let lastRouteElapsedMs = 0;
+    let lastProofElapsedMs = 0;
+    let lastRustResult = null;
+    let lastReferenceResult = null;
+    let lastRoutedQuery = '';
+    let currentProofBatchCount = 0;
+    let workerProgress = new Map();
+    const registeredFileName = 'selected.parquet';
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      logEl.textContent += `[${time}] ${message}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes)) return '-';
+      const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+      let value = bytes;
+      let unitIndex = 0;
+      while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex++;
+      }
+      return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[unitIndex]}`;
+    }
+
+    function formatNumber(value, digits = 0) {
+      if (!Number.isFinite(value)) return '-';
+      return new Intl.NumberFormat(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(value);
+    }
+
+    function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+    function updateHeapMetric() {
+      if (performance.memory && Number.isFinite(performance.memory.usedJSHeapSize)) {
+        $('heapValue').textContent = formatBytes(performance.memory.usedJSHeapSize);
+      } else {
+        $('heapValue').textContent = 'n/a';
+      }
+    }
+
+    function updateIsolationStatus() {
+      if (window.crossOriginIsolated) {
+        isolationStatusEl.className = 'status good';
+        isolationStatusEl.textContent = 'crossOriginIsolated = true. Shared WebAssembly.Memory is available.';
+      } else {
+        isolationStatusEl.className = 'status bad';
+        isolationStatusEl.textContent = 'crossOriginIsolated = false. This page requires COOP/COEP and shared WebAssembly.Memory.';
+      }
+    }
+
+    class WasmMemoryRouter {
+      constructor(memories) {
+        this.memories = memories;
+        this.cursorShard = 0;
+        this.cursorOffset = 0;
+        this.entries = [];
+        this.totalRows = 0;
+        this.totalBytes = 0;
+      }
+      get totalCapacityBytes() { return this.memories.reduce((sum, m) => sum + m.buffer.byteLength, 0); }
+      get freeBytes() { return this.totalCapacityBytes - this.totalBytes; }
+      writeBatch(bytes, rowCount) {
+        while (true) {
+          if (this.cursorShard >= this.memories.length) throw new Error('Router exhausted all wasm-memory shards.');
+          const buffer = this.memories[this.cursorShard].buffer;
+          const shardSpace = buffer.byteLength - this.cursorOffset;
+          if (bytes.byteLength <= shardSpace) {
+            new Uint8Array(buffer, this.cursorOffset, bytes.byteLength).set(bytes);
+            const entry = {
+              id: this.entries.length,
+              rowCount,
+              byteLength: bytes.byteLength,
+              placement: { shardIndex: this.cursorShard, offset: this.cursorOffset, byteLength: bytes.byteLength },
+            };
+            this.cursorOffset += bytes.byteLength;
+            this.entries.push(entry);
+            this.totalRows += rowCount;
+            this.totalBytes += bytes.byteLength;
+            return entry;
+          }
+          this.cursorShard++;
+          this.cursorOffset = 0;
+        }
+      }
+    }
+
+    function renderWorkerProgress() {
+      if (workerProgress.size === 0) {
+        workerProgressSummaryEl.textContent = 'No worker progress yet.';
+        return;
+      }
+      const lines = [...workerProgress.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([workerId, progress]) => {
+          const total = progress.totalBatches || 0;
+          const done = progress.completedBatches || 0;
+          const pct = total > 0 ? (done / total) * 100 : 0;
+          return `worker ${workerId}: ${done}/${total} batches (${pct.toFixed(1)}%), rows=${formatNumber(progress.rowCount || 0)}, completed=${progress.done ? 'yes' : 'no'}`;
+        });
+      workerProgressSummaryEl.textContent = lines.join('\n');
+    }
+
+    function renderResults() {
+      if (!lastRustResult && !lastReferenceResult) {
+        resultSummaryEl.textContent = 'No result yet.';
+        return;
+      }
+      resultSummaryEl.textContent = JSON.stringify({ rust: lastRustResult, duckdb: lastReferenceResult }, null, 2);
+    }
+
+    function updateMetrics(workersDone = null) {
+      $('shardCountValue').textContent = formatNumber(memories.length);
+      $('bankSizeValue').textContent = formatBytes(router ? router.totalCapacityBytes : memories.reduce((sum, m) => sum + m.buffer.byteLength, 0));
+      $('freeSpaceValue').textContent = formatBytes(router ? router.freeBytes : memories.reduce((sum, m) => sum + m.buffer.byteLength, 0));
+      $('batchCountValue').textContent = formatNumber(router ? router.entries.length : 0);
+      $('rowCountValue').textContent = formatNumber(router ? router.totalRows : 0);
+      $('byteCountValue').textContent = formatBytes(router ? router.totalBytes : 0);
+      $('routeTimeValue').textContent = lastRouteElapsedMs ? `${(lastRouteElapsedMs / 1000).toFixed(1)} s` : '-';
+      $('proofTimeValue').textContent = lastProofElapsedMs ? `${(lastProofElapsedMs / 1000).toFixed(1)} s` : '-';
+      $('proofBatchesValue').textContent = formatNumber(currentProofBatchCount);
+      if (workersDone !== null) $('workersDoneValue').textContent = formatNumber(workersDone);
+      updateHeapMetric();
+      renderWorkerProgress();
+      renderResults();
+    }
+
+    async function initDuckDB() {
+      if (db && conn) return;
+      duckdbStatusEl.className = 'status warn';
+      duckdbStatusEl.textContent = 'Loading DuckDB-Wasm...';
+      log('Importing DuckDB-Wasm and Apache Arrow from CDN...');
+      duckdb = await import(DUCKDB_CDN);
+      arrow = await import(ARROW_CDN);
+      const bundles = duckdb.getJsDelivrBundles();
+      const bundle = await duckdb.selectBundle(bundles);
+      const worker = await duckdb.createWorker(bundle.mainWorker);
+      db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(), worker);
+      await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+      conn = await db.connect();
+      duckdbStatusEl.className = 'status good';
+      duckdbStatusEl.textContent = 'DuckDB-Wasm initialized and ready.';
+      log('DuckDB-Wasm initialized successfully.');
+    }
+
+    async function initRustModule() {
+      rustStatusEl.className = 'status warn';
+      rustStatusEl.textContent = 'Loading Rust Arrow IPC module...';
+      const response = await fetch(RUST_WASM_URL);
+      if (!response.ok) throw new Error(`Failed to fetch ${RUST_WASM_URL}: ${response.status}`);
+      rustWasmBytes = await response.arrayBuffer();
+      rustStatusEl.className = 'status good';
+      rustStatusEl.textContent = 'Rust Arrow IPC module loaded.';
+      log('Rust Arrow IPC module loaded.');
+      if (router?.entries.length) $('proveBtn').disabled = false;
+    }
+
+    async function pickParquetFile() {
+      if (!db) await initDuckDB();
+      selectedFile = null;
+      selectedHandle = null;
+      if (window.showOpenFilePicker) {
+        const [handle] = await window.showOpenFilePicker({
+          multiple: false,
+          types: [{ description: 'Parquet files', accept: { 'application/octet-stream': ['.parquet'], 'application/x-parquet': ['.parquet'] } }]
+        });
+        if (!handle) return;
+        selectedHandle = handle;
+        selectedFile = await handle.getFile();
+      } else {
+        fileInput.value = '';
+        fileInput.click();
+        await new Promise((resolve, reject) => {
+          fileInput.onchange = () => fileInput.files?.[0] ? resolve() : reject(new Error('No file selected'));
+        });
+        selectedFile = fileInput.files[0];
+      }
+      if (!selectedFile) throw new Error('No file selected.');
+      try { await db.dropFile?.(registeredFileName); } catch {}
+      try {
+        await db.registerFileHandle(registeredFileName, selectedFile, duckdb.DuckDBDataProtocol.BROWSER_FILEREADER, true);
+        log(`Registered ${selectedFile.name} via FileReader-backed file handle.`);
+      } catch (error) {
+        if (selectedHandle && duckdb.DuckDBDataProtocol?.BROWSER_FSACCESS !== undefined) {
+          await db.registerFileHandle(registeredFileName, selectedHandle, duckdb.DuckDBDataProtocol.BROWSER_FSACCESS, true);
+          log(`Registered ${selectedFile.name} via File System Access handle fallback.`);
+        } else {
+          throw error;
+        }
+      }
+      fileStatusEl.className = 'status good';
+      fileStatusEl.textContent = `Selected file: ${selectedFile.name} (${formatBytes(selectedFile.size)}). Registered as ${registeredFileName}.`;
+    }
+
+    async function allocateBank() {
+      const shardMiB = Number($('shardMiB').value);
+      const targetGiB = Number($('targetGiB').value);
+      const safetyRelease = Math.trunc(Number($('safetyRelease').value));
+      if (!Number.isFinite(shardMiB) || shardMiB <= 0) throw new Error('Invalid shard size.');
+      if (!Number.isFinite(targetGiB) || targetGiB <= 0) throw new Error('Invalid target bank size.');
+      const shardBytes = shardMiB * 1024 * 1024;
+      if (shardBytes % 65536 !== 0) throw new Error('Shard size must align to 64 KiB wasm pages.');
+      const pages = shardBytes / 65536;
+      const targetBytes = targetGiB * 1024 * 1024 * 1024;
+
+      memories = [];
+      router = null;
+      lastRouteElapsedMs = 0;
+      lastProofElapsedMs = 0;
+      lastRustResult = null;
+      lastReferenceResult = null;
+      currentProofBatchCount = 0;
+      workerProgress.clear();
+      $('proveBtn').disabled = true;
+      updateMetrics(0);
+      proofStatusEl.className = 'status warn';
+      proofStatusEl.textContent = 'Rust Arrow proof not started yet.';
+      log(`Allocating shared WebAssembly.Memory bank: ${targetGiB} GiB target with ${shardMiB} MiB shards...`);
+
+      while (memories.reduce((sum, m) => sum + m.buffer.byteLength, 0) < targetBytes) {
+        try {
+          const memory = new WebAssembly.Memory({ shared: true, initial: pages, maximum: pages });
+          const touch = new Uint8Array(memory.buffer);
+          for (let i = 0; i < touch.length; i += 4096) touch[i] = (touch[i] + 1) & 0xff;
+          if (touch.length) touch[touch.length - 1] = (touch[touch.length - 1] + 1) & 0xff;
+          memories.push(memory);
+          if (memories.length % 4 === 0) updateMetrics(0);
+          await sleep(20);
+        } catch (error) {
+          log(`Allocation failed after ${memories.length} shard(s): ${error.message}`);
+          if (safetyRelease > 0) {
+            const count = Math.min(safetyRelease, memories.length);
+            for (let i = 0; i < count; i++) memories.pop();
+            log(`Safety release removed ${count} shard(s).`);
+          }
+          throw error;
+        }
+      }
+      router = new WasmMemoryRouter(memories);
+      updateMetrics(0);
+      log(`Shared WebAssembly.Memory bank ready: ${formatBytes(router.totalCapacityBytes)} across ${memories.length} shard(s).`);
+    }
+
+    function batchToColumnArrays(batch) {
+      const columns = {};
+      for (let index = 0; index < batch.schema.fields.length; index++) {
+        const field = batch.schema.fields[index];
+        const vector = typeof batch.getChildAt === 'function' ? batch.getChildAt(index) : batch.getChild(field.name);
+        if (!vector) throw new Error(`Unable to access column vector for ${field.name}`);
+        columns[field.name] = typeof vector.toArray === 'function' ? vector.toArray() : Array.from({ length: batch.numRows }, (_, row) => vector.get(row));
+      }
+      return columns;
+    }
+
+    function recordBatchToIPCBytes(batch) {
+      const table = arrow.tableFromArrays(batchToColumnArrays(batch));
+      return arrow.tableToIPC(table, 'stream');
+    }
+
+    async function routeQuery() {
+      if (!conn) throw new Error('DuckDB-Wasm is not initialized.');
+      if (!selectedFile) throw new Error('No Parquet file selected.');
+      if (!memories.length) throw new Error('Wasm bank not allocated.');
+      const sql = $('sqlInput').value.trim();
+      if (!sql) throw new Error('SQL query is empty.');
+      lastRoutedQuery = sql.replace(/;\s*$/, '');
+      const maxBatchesValue = Number($('maxBatches').value);
+      const maxBatches = Number.isFinite(maxBatchesValue) && maxBatchesValue > 0 ? Math.trunc(maxBatchesValue) : Infinity;
+
+      router = new WasmMemoryRouter(memories);
+      lastRouteElapsedMs = 0;
+      lastProofElapsedMs = 0;
+      lastRustResult = null;
+      lastReferenceResult = null;
+      currentProofBatchCount = 0;
+      workerProgress.clear();
+      $('proveBtn').disabled = true;
+      updateMetrics(0);
+      proofStatusEl.className = 'status warn';
+      proofStatusEl.textContent = 'Routing Arrow IPC batches into the bank...';
+      log('Running DuckDB query and routing Arrow IPC batches into the bank...');
+      log(sql);
+
+      const startedAt = performance.now();
+      let batchIndex = 0;
+      const reader = await conn.send(sql);
+      for await (const batch of reader) {
+        if (batchIndex >= maxBatches) {
+          log(`Reached configured max batch count (${maxBatches}). Stopping stream consumption.`);
+          break;
+        }
+        const bytes = recordBatchToIPCBytes(batch);
+        const entry = router.writeBatch(bytes, batch.numRows);
+        if (entry.byteLength > memories[entry.placement.shardIndex].buffer.byteLength) {
+          throw new Error('Batch exceeded shard size.');
+        }
+        batchIndex++;
+        if (batchIndex === 1 || batchIndex % 1000 === 0) {
+          log(`Routed batch ${batchIndex}: rows so far=${formatNumber(router.totalRows)}, Arrow bytes=${formatBytes(router.totalBytes)}, free bank=${formatBytes(router.freeBytes)}.`);
+          updateMetrics(0);
+          await sleep(0);
+        }
+      }
+      lastRouteElapsedMs = performance.now() - startedAt;
+      proofStatusEl.className = 'status warn';
+      proofStatusEl.textContent = 'Routing complete. Ready to run the Rust Arrow proof.';
+      $('proveBtn').disabled = router.entries.length === 0 || !rustWasmBytes;
+      log(`Routing complete. Stored ${formatNumber(router.entries.length)} batch(es), ${formatNumber(router.totalRows)} row(s), ${formatBytes(router.totalBytes)} Arrow bytes in ${(lastRouteElapsedMs / 1000).toFixed(1)} s.`);
+      updateMetrics(0);
+    }
+
+    function createRustWorkerUrl() {
+      const source = `
+        let compiledModule = null;
+        const instanceCache = new Map();
+        async function getCompiledModule(wasmBytes) {
+          if (!compiledModule) compiledModule = await WebAssembly.compile(wasmBytes);
+          return compiledModule;
+        }
+        async function getInstance(memory, module, shardIndex) {
+          if (!instanceCache.has(shardIndex)) {
+            const instance = await WebAssembly.instantiate(module, { env: { memory } });
+            instanceCache.set(shardIndex, instance);
+          }
+          return instanceCache.get(shardIndex);
+        }
+        self.onmessage = async (event) => {
+          const { workerId, wasmBytes, memories, entries } = event.data;
+          try {
+            const module = await getCompiledModule(wasmBytes);
+            let rowCount = 0;
+            let sumFeatureA = 0;
+            let sumFeatureB = 0;
+            let sumFeatureC = 0;
+            let label0 = 0;
+            let label1 = 0;
+            let batches = 0;
+            const totalBatches = entries.length;
+            for (const entry of entries) {
+              const placement = entry.placement;
+              const instance = await getInstance(memories[placement.shardIndex], module, placement.shardIndex);
+              const rc = instance.exports.parse_arrow_ipc_batch(placement.offset, placement.byteLength);
+              if (rc !== 0) throw new Error('parse_arrow_ipc_batch returned non-zero status');
+              rowCount += Number(instance.exports.last_row_count());
+              sumFeatureA += Number(instance.exports.last_sum_feature_a());
+              sumFeatureB += Number(instance.exports.last_sum_feature_b());
+              sumFeatureC += Number(instance.exports.last_sum_feature_c());
+              label0 += Number(instance.exports.last_label_0());
+              label1 += Number(instance.exports.last_label_1());
+              batches += 1;
+              if (batches === 1 || batches % 100 === 0 || batches === totalBatches) {
+                self.postMessage({ type: 'progress', workerId, completedBatches: batches, totalBatches, rowCount });
+              }
+            }
+            self.postMessage({ type: 'done', ok: true, workerId, rowCount, sumFeatureA, sumFeatureB, sumFeatureC, label0, label1, batches });
+          } catch (error) {
+            self.postMessage({ type: 'done', ok: false, workerId, error: error.message || String(error) });
+          }
+        };
+      `;
+      return URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    }
+
+    function aggregateResults(results) {
+      return results.reduce((acc, result) => {
+        acc.rowCount += result.rowCount;
+        acc.sumFeatureA += result.sumFeatureA;
+        acc.sumFeatureB += result.sumFeatureB;
+        acc.sumFeatureC += result.sumFeatureC;
+        acc.label0 += result.label0;
+        acc.label1 += result.label1;
+        acc.batches += result.batches;
+        return acc;
+      }, { rowCount: 0, sumFeatureA: 0, sumFeatureB: 0, sumFeatureC: 0, label0: 0, label1: 0, batches: 0 });
+    }
+
+    async function runReferenceAggregate() {
+      const sql = `
+        SELECT
+          COUNT(*) AS row_count,
+          SUM(feature_a) AS sum_feature_a,
+          SUM(feature_b) AS sum_feature_b,
+          SUM(feature_c) AS sum_feature_c,
+          SUM(CASE WHEN label = 0 THEN 1 ELSE 0 END) AS label_0,
+          SUM(CASE WHEN label = 1 THEN 1 ELSE 0 END) AS label_1
+        FROM (${lastRoutedQuery}) q
+      `;
+      const table = await conn.query(sql);
+      const getValue = (name, index) => Number((typeof table.getChild === 'function' ? table.getChild(name) : table.getChildAt(index)).get(0));
+      return {
+        rowCount: getValue('row_count', 0),
+        sumFeatureA: getValue('sum_feature_a', 1),
+        sumFeatureB: getValue('sum_feature_b', 2),
+        sumFeatureC: getValue('sum_feature_c', 3),
+        label0: getValue('label_0', 4),
+        label1: getValue('label_1', 5),
+      };
+    }
+
+    function nearlyEqual(a, b, tolerance = 1e-6) {
+      const scale = Math.max(1, Math.abs(a), Math.abs(b));
+      return Math.abs(a - b) <= tolerance * scale;
+    }
+
+    async function runRustProof() {
+      if (!rustWasmBytes) throw new Error('Rust Arrow module not loaded.');
+      if (!router || router.entries.length === 0) throw new Error('No routed Arrow batches available.');
+      const workerCount = Number($('workerCount').value);
+      if (!Number.isFinite(workerCount) || workerCount <= 0) throw new Error('Invalid worker count.');
+      const proofBatchCapValue = Number($('proofBatchCap').value);
+      const proofBatchCap = Number.isFinite(proofBatchCapValue) && proofBatchCapValue > 0 ? Math.trunc(proofBatchCapValue) : router.entries.length;
+      const proofEntries = router.entries.slice(0, Math.min(proofBatchCap, router.entries.length));
+      if (proofEntries.length === 0) throw new Error('Proof batch cap selected zero batches.');
+
+      proofStatusEl.className = 'status warn';
+      proofStatusEl.textContent = `Running Rust Arrow proof over ${formatNumber(proofEntries.length)} batch(es)...`;
+      lastProofElapsedMs = 0;
+      lastRustResult = null;
+      lastReferenceResult = null;
+      currentProofBatchCount = proofEntries.length;
+      workerProgress.clear();
+      updateMetrics(0);
+
+      const buckets = Array.from({ length: workerCount }, () => []);
+      proofEntries.forEach((entry, index) => buckets[index % workerCount].push(entry));
+      const workerUrl = createRustWorkerUrl();
+      const startedAt = performance.now();
+      let completed = 0;
+
+      const results = await new Promise((resolve, reject) => {
+        const out = [];
+        for (let workerId = 0; workerId < workerCount; workerId++) {
+          workerProgress.set(workerId, {
+            completedBatches: 0,
+            totalBatches: buckets[workerId].length,
+            rowCount: 0,
+            done: false,
+          });
+          const worker = new Worker(workerUrl);
+          worker.onmessage = (event) => {
+            const data = event.data;
+            if (data.type === 'progress') {
+              workerProgress.set(data.workerId, {
+                completedBatches: data.completedBatches,
+                totalBatches: data.totalBatches,
+                rowCount: data.rowCount,
+                done: false,
+              });
+              updateMetrics(completed);
+              return;
+            }
+
+            worker.terminate();
+            if (!data.ok) {
+              reject(new Error(`Rust worker ${data.workerId} failed: ${data.error}`));
+              return;
+            }
+            workerProgress.set(data.workerId, {
+              completedBatches: data.batches,
+              totalBatches: buckets[data.workerId].length,
+              rowCount: data.rowCount,
+              done: true,
+            });
+            out.push(data);
+            completed++;
+            log(`Rust worker ${data.workerId} done: rows=${formatNumber(data.rowCount)}, batches=${formatNumber(data.batches)}.`);
+            updateMetrics(completed);
+            if (completed === workerCount) resolve(out);
+          };
+          worker.onerror = (error) => { worker.terminate(); reject(error); };
+          worker.postMessage({ workerId, wasmBytes: rustWasmBytes, memories, entries: buckets[workerId] });
+        }
+      }).finally(() => URL.revokeObjectURL(workerUrl));
+
+      lastProofElapsedMs = performance.now() - startedAt;
+      lastRustResult = aggregateResults(results);
+      const subsetSql = `SELECT * FROM (${lastRoutedQuery}) q LIMIT ${proofEntries.reduce((sum, entry) => sum + entry.rowCount, 0)}`;
+      const savedQuery = lastRoutedQuery;
+      lastRoutedQuery = subsetSql;
+      lastReferenceResult = await runReferenceAggregate();
+      lastRoutedQuery = savedQuery;
+      updateMetrics(workerCount);
+
+      const success =
+        lastRustResult.rowCount === lastReferenceResult.rowCount &&
+        lastRustResult.label0 === lastReferenceResult.label0 &&
+        lastRustResult.label1 === lastReferenceResult.label1 &&
+        nearlyEqual(lastRustResult.sumFeatureA, lastReferenceResult.sumFeatureA) &&
+        nearlyEqual(lastRustResult.sumFeatureB, lastReferenceResult.sumFeatureB) &&
+        nearlyEqual(lastRustResult.sumFeatureC, lastReferenceResult.sumFeatureC);
+
+      if (success) {
+        proofStatusEl.className = 'status good';
+        proofStatusEl.textContent = `SUCCESS: Rust Arrow IPC aggregate matched DuckDB reference over ${formatNumber(lastRustResult.rowCount)} rows.`;
+        log(`SUCCESS: Rust Arrow IPC aggregate matched DuckDB reference in ${(lastProofElapsedMs / 1000).toFixed(1)} s.`);
+      } else {
+        proofStatusEl.className = 'status bad';
+        proofStatusEl.textContent = 'Rust Arrow IPC aggregate did not match DuckDB reference.';
+        log('FAIL: Rust Arrow IPC aggregate mismatch.');
+      }
+      renderResults();
+    }
+
+    async function releaseAll() {
+      memories = [];
+      router = null;
+      lastRouteElapsedMs = 0;
+      lastProofElapsedMs = 0;
+      lastRustResult = null;
+      lastReferenceResult = null;
+      lastRoutedQuery = '';
+      $('proveBtn').disabled = true;
+      updateMetrics(0);
+      proofStatusEl.className = 'status warn';
+      proofStatusEl.textContent = 'Released wasm-memory shard bank.';
+      log('Released shared WebAssembly.Memory shard bank references.');
+    }
+
+    $('initDuckdbBtn').addEventListener('click', () => initDuckDB().catch((e) => { duckdbStatusEl.className='status bad'; duckdbStatusEl.textContent=`DuckDB init failed: ${e.message}`; log(`DuckDB init failed: ${e.message}`); }));
+    $('initRustBtn').addEventListener('click', () => initRustModule().catch((e) => { rustStatusEl.className='status bad'; rustStatusEl.textContent=`Rust module load failed: ${e.message}`; log(`Rust module load failed: ${e.message}`); }));
+    $('pickFileBtn').addEventListener('click', () => pickParquetFile().catch((e) => { fileStatusEl.className='status bad'; fileStatusEl.textContent=`File selection/registration failed: ${e.message}`; log(`File pick/register failed: ${e.message}`); }));
+    $('allocateBtn').addEventListener('click', () => allocateBank().catch((e) => log(`Allocation failed: ${e.message}`)));
+    $('routeBtn').addEventListener('click', () => routeQuery().catch((e) => { proofStatusEl.className='status bad'; proofStatusEl.textContent=`Routing failed: ${e.message}`; log(`Routing failed: ${e.message}`); }));
+    $('proveBtn').addEventListener('click', () => runRustProof().catch((e) => { proofStatusEl.className='status bad'; proofStatusEl.textContent=`Rust Arrow proof failed: ${e.message}`; log(`Rust Arrow proof failed: ${e.message}`); }));
+    $('releaseBtn').addEventListener('click', () => releaseAll().catch((e) => log(`Release failed: ${e.message}`)));
+
+    updateIsolationStatus();
+    updateMetrics(0);
+    renderResults();
+    log('Ready. Init DuckDB-Wasm, load the Rust Arrow module, pick the 6 GiB parquet, allocate a 12 GiB shared WebAssembly.Memory bank, route Arrow IPC batches, then run the Rust Arrow proof.');
+  </script>
+</body>
+</html>

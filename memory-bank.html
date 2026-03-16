@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MVT 1.6 - Greedy Shared Memory Probe</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #121a33;
+      --panel-2: #0f1730;
+      --text: #e7ecff;
+      --muted: #a6b0d5;
+      --good: #66e3a4;
+      --warn: #ffd166;
+      --bad: #ff7b7b;
+      --border: #26345f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #0a0f1d, #0b1020 40%, #0d1327);
+      color: var(--text);
+    }
+    .wrap {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { margin: 8px 0; color: var(--muted); }
+    .card {
+      background: rgba(18, 26, 51, 0.9);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      margin-top: 18px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.22);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+    label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    input, button {
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+    }
+    button {
+      background: linear-gradient(180deg, #1c6fff, #1758cc);
+      border: 0;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .secondary { background: #1a2447; border: 1px solid var(--border); }
+    .danger { background: linear-gradient(180deg, #c14444, #9e2f2f); }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    .status {
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #101833;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
+    .status.good { border-color: rgba(102, 227, 164, 0.35); color: var(--good); }
+    .status.warn { border-color: rgba(255, 209, 102, 0.35); color: var(--warn); }
+    .status.bad { border-color: rgba(255, 123, 123, 0.35); color: var(--bad); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .metric {
+      background: #0e1630;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .metric .label {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .metric .value {
+      margin-top: 8px;
+      font-size: 22px;
+      font-weight: 800;
+    }
+    pre {
+      margin: 0;
+      background: #0b1228;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+      max-height: 360px;
+      color: #cfe0ff;
+    }
+    .small { font-size: 12px; color: var(--muted); }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>MVT 1.6: Greedy Shared Memory Probe</h1>
+    <p>
+      This page estimates how much shared memory your browser tab can hold safely by allocating
+      multiple <code>SharedArrayBuffer</code> shards and touching one byte per memory page.
+      It is designed to answer: “How much RAM can our browser-native data science runtime use?”
+    </p>
+
+    <div id="isolationStatus" class="status warn">Checking SharedArrayBuffer requirements...</div>
+    <div id="riskStatus" class="status warn">This is a stress test. Leave headroom for the OS and browser. Do not aim for literal 100% of system RAM.</div>
+
+    <div class="card">
+      <strong>Probe setup</strong>
+      <div class="grid">
+        <label>
+          Shard size (MiB)
+          <input id="shardMiB" type="number" min="16" step="16" value="256" />
+        </label>
+        <label>
+          Target total (GiB)
+          <input id="targetGiB" type="number" min="1" step="1" value="6" />
+        </label>
+        <label>
+          Max shard attempts
+          <input id="maxShards" type="number" min="1" step="1" value="64" />
+        </label>
+        <label>
+          Safety release shards on failure
+          <input id="safetyRelease" type="number" min="0" step="1" value="2" />
+        </label>
+        <label>
+          Pause between shards (ms)
+          <input id="pauseMs" type="number" min="0" step="50" value="250" />
+        </label>
+        <label>
+          Hold after probe (seconds)
+          <input id="holdSeconds" type="number" min="0" step="1" value="20" />
+        </label>
+      </div>
+
+      <div class="row">
+        <button id="startBtn">Start greedy probe</button>
+        <button id="stopBtn" class="secondary" disabled>Stop after current shard</button>
+        <button id="releaseBtn" class="danger">Release all memory</button>
+      </div>
+
+      <p class="small">
+        Recommended: start with <code>256 MiB</code> shards and a <code>6 GiB</code> target. If stable, try larger shards later.
+        Open Chrome Task Manager while this runs.
+      </p>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="label">deviceMemory*</div><div id="deviceMemoryValue" class="value">-</div></div>
+      <div class="metric"><div class="label">hardwareConcurrency</div><div id="coreValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Allocated shards</div><div id="shardCountValue" class="value">0</div></div>
+      <div class="metric"><div class="label">Total allocated</div><div id="totalAllocatedValue" class="value">0 B</div></div>
+      <div class="metric"><div class="label">Recommended usable</div><div id="recommendedValue" class="value">0 B</div></div>
+      <div class="metric"><div class="label">Last result</div><div id="lastResultValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Chrome heap used*</div><div id="heapValue" class="value">-</div></div>
+    </div>
+
+    <div class="card">
+      <strong>Interpretation</strong>
+      <p class="small">
+        <strong>Total allocated</strong> is the raw size of the retained shared-memory bank. A conservative starting point for
+        <strong>Recommended usable</strong> is total allocated minus the larger of <code>2 shards</code> or <code>15%</code>, because you still need room for the browser,
+        the page itself, workers, compiled Wasm code, GPU buffers, and the rest of the OS.
+      </p>
+      <p class="small">
+        If you later build the runtime around Wasm32, remember: a <em>single</em> Wasm memory is usually limited to <code>&lt;= 4 GiB</code>.
+        To use more than that overall, use a bank of shared shards.
+      </p>
+    </div>
+
+    <div class="card">
+      <strong>Log</strong>
+      <pre id="log"></pre>
+      <p class="small">
+        * <code>navigator.deviceMemory</code> is coarse and often capped at <code>8</code>. It is not your exact physical RAM.
+        * <code>performance.memory</code> is JS heap only, not total browser process memory.
+      </p>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const logEl = $("log");
+    const isolationStatusEl = $("isolationStatus");
+    const riskStatusEl = $("riskStatus");
+    const startBtn = $("startBtn");
+    const stopBtn = $("stopBtn");
+    const releaseBtn = $("releaseBtn");
+    const shardMiBInput = $("shardMiB");
+    const targetGiBInput = $("targetGiB");
+    const maxShardsInput = $("maxShards");
+    const safetyReleaseInput = $("safetyRelease");
+    const pauseMsInput = $("pauseMs");
+    const holdSecondsInput = $("holdSeconds");
+
+    let bank = [];
+    let stopRequested = false;
+    let running = false;
+    let memoryPoll = null;
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      logEl.textContent += `[${time}] ${message}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes)) return "-";
+      const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+      let value = bytes;
+      let unitIndex = 0;
+      while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex++;
+      }
+      return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[unitIndex]}`;
+    }
+
+    function formatNumber(value) {
+      if (!Number.isFinite(value)) return "-";
+      return new Intl.NumberFormat().format(value);
+    }
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function nextFrame() {
+      return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+    }
+
+    function totalAllocatedBytes() {
+      return bank.reduce((sum, shard) => sum + shard.byteLength, 0);
+    }
+
+    function recommendedUsableBytes() {
+      const total = totalAllocatedBytes();
+      const shardBytes = bank[0]?.byteLength || 0;
+      const byPercent = Math.floor(total * 0.15);
+      const byShardReserve = shardBytes * Math.min(2, bank.length);
+      return Math.max(0, total - Math.max(byPercent, byShardReserve));
+    }
+
+    function updateMetrics(lastResult = "-") {
+      $("deviceMemoryValue").textContent = navigator.deviceMemory ? `${navigator.deviceMemory} GiB` : "n/a";
+      $("coreValue").textContent = navigator.hardwareConcurrency ? formatNumber(navigator.hardwareConcurrency) : "n/a";
+      $("shardCountValue").textContent = formatNumber(bank.length);
+      $("totalAllocatedValue").textContent = formatBytes(totalAllocatedBytes());
+      $("recommendedValue").textContent = formatBytes(recommendedUsableBytes());
+      $("lastResultValue").textContent = lastResult;
+
+      if (performance.memory && Number.isFinite(performance.memory.usedJSHeapSize)) {
+        $("heapValue").textContent = formatBytes(performance.memory.usedJSHeapSize);
+      } else {
+        $("heapValue").textContent = "n/a";
+      }
+    }
+
+    function updateIsolationStatus() {
+      if (window.crossOriginIsolated) {
+        isolationStatusEl.className = "status good";
+        isolationStatusEl.textContent = "crossOriginIsolated = true. SharedArrayBuffer is available.";
+      } else {
+        isolationStatusEl.className = "status bad";
+        isolationStatusEl.textContent = [
+          "crossOriginIsolated = false. SharedArrayBuffer will not work.",
+          "Serve with:",
+          "Cross-Origin-Opener-Policy: same-origin",
+          "Cross-Origin-Embedder-Policy: require-corp"
+        ].join("\n");
+      }
+    }
+
+    function updateRiskStatus() {
+      const deviceMemory = navigator.deviceMemory || 8;
+      riskStatusEl.className = "status warn";
+      riskStatusEl.textContent = [
+        `deviceMemory reports ${deviceMemory} GiB (coarse, privacy-capped).`,
+        "A good operating target is usually 'large majority of available RAM', not literal full exhaustion.",
+        "For a production runtime, prefer a memory bank of shards plus a safety margin rather than one giant allocation."
+      ].join("\n");
+    }
+
+    function touchShard(sab) {
+      const view = new Uint8Array(sab);
+      const pageStride = 4096;
+      for (let offset = 0; offset < view.length; offset += pageStride) {
+        view[offset] = (view[offset] + 1) & 0xff;
+      }
+      if (view.length > 0) {
+        view[view.length - 1] = (view[view.length - 1] + 1) & 0xff;
+      }
+    }
+
+    function releaseLastShards(count) {
+      const toRelease = Math.min(count, bank.length);
+      for (let i = 0; i < toRelease; i++) {
+        bank.pop();
+      }
+      updateMetrics(`released ${toRelease}`);
+      log(`Released ${toRelease} shard(s). Current retained bank: ${formatBytes(totalAllocatedBytes())}.`);
+    }
+
+    async function releaseAll() {
+      stopRequested = true;
+      running = false;
+      bank = [];
+      updateMetrics("released all");
+      log("Dropped all SharedArrayBuffer references. Memory should return after GC/browser reclamation.");
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      await sleep(100);
+      await nextFrame();
+      updateMetrics("released all");
+    }
+
+    async function runProbe() {
+      if (!window.crossOriginIsolated) {
+        updateIsolationStatus();
+        log("Blocked: SharedArrayBuffer requires cross-origin isolation.");
+        return;
+      }
+      if (running) return;
+
+      const shardMiB = Number(shardMiBInput.value);
+      const targetGiB = Number(targetGiBInput.value);
+      const maxShards = Number(maxShardsInput.value);
+      const safetyRelease = Number(safetyReleaseInput.value);
+      const pauseMs = Number(pauseMsInput.value);
+      const holdSeconds = Number(holdSecondsInput.value);
+
+      if (!Number.isFinite(shardMiB) || shardMiB <= 0) {
+        log("Invalid shard size.");
+        return;
+      }
+      if (!Number.isFinite(targetGiB) || targetGiB <= 0) {
+        log("Invalid target total.");
+        return;
+      }
+      if (!Number.isFinite(maxShards) || maxShards <= 0) {
+        log("Invalid max shard count.");
+        return;
+      }
+      if (!Number.isFinite(safetyRelease) || safetyRelease < 0) {
+        log("Invalid safety release count.");
+        return;
+      }
+      if (!Number.isFinite(pauseMs) || pauseMs < 0) {
+        log("Invalid pause duration.");
+        return;
+      }
+      if (!Number.isFinite(holdSeconds) || holdSeconds < 0) {
+        log("Invalid hold duration.");
+        return;
+      }
+
+      const shardBytes = shardMiB * 1024 * 1024;
+      const targetBytes = targetGiB * 1024 * 1024 * 1024;
+      stopRequested = false;
+      running = true;
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      logEl.textContent = "";
+      log(`Starting greedy probe with ${shardMiB} MiB shards, targeting ${targetGiB} GiB total, up to ${maxShards} attempt(s).`);
+      log(`Current retained bank before probe: ${formatBytes(totalAllocatedBytes())}.`);
+      updateMetrics("running");
+
+      if (memoryPoll) clearInterval(memoryPoll);
+      memoryPoll = setInterval(() => updateMetrics(running ? "running" : "idle"), 1000);
+
+      let failure = null;
+      let attempts = 0;
+
+      try {
+        while (attempts < maxShards && !stopRequested) {
+          if (totalAllocatedBytes() >= targetBytes) {
+            log(`Target reached: retained bank is now ${formatBytes(totalAllocatedBytes())}.`);
+            break;
+          }
+          attempts++;
+          log(`Attempt ${attempts}: allocating ${formatBytes(shardBytes)} shard...`);
+          let sab;
+          try {
+            sab = new SharedArrayBuffer(shardBytes);
+          } catch (error) {
+            failure = error;
+            log(`Allocation failed on attempt ${attempts}: ${error.message}`);
+            break;
+          }
+
+          try {
+            touchShard(sab);
+          } catch (error) {
+            failure = error;
+            log(`Touch/commit failed on attempt ${attempts}: ${error.message}`);
+            break;
+          }
+
+          bank.push(sab);
+          updateMetrics(`allocated ${bank.length}`);
+          log(`Shard ${bank.length} retained. Total bank: ${formatBytes(totalAllocatedBytes())}. Recommended usable starting point: ${formatBytes(recommendedUsableBytes())}.`);
+
+          await nextFrame();
+          if (pauseMs > 0) await sleep(pauseMs);
+        }
+      } finally {
+        running = false;
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+      }
+
+      if (stopRequested) {
+        log("Stop requested by user. Keeping current memory bank for inspection.");
+        updateMetrics("stopped");
+      } else if (failure) {
+        const reserveCount = Math.trunc(safetyRelease);
+        if (reserveCount > 0) {
+          log(`Applying safety valve: releasing ${reserveCount} shard(s).`);
+          releaseLastShards(reserveCount);
+        }
+        updateMetrics("limit reached");
+        log(`Probe stopped at browser/runtime limit. Retained bank after safety release: ${formatBytes(totalAllocatedBytes())}.`);
+      } else if (totalAllocatedBytes() >= targetBytes) {
+        updateMetrics("target reached");
+        log(`Reached requested target (${targetGiB} GiB). Retained bank: ${formatBytes(totalAllocatedBytes())}.`);
+      } else {
+        updateMetrics("max attempts reached");
+        log(`Reached configured max attempts (${maxShards}). Retained bank: ${formatBytes(totalAllocatedBytes())}.`);
+      }
+
+      const normalizedHoldSeconds = Math.trunc(holdSeconds);
+      if (normalizedHoldSeconds > 0 && bank.length > 0) {
+        log(`Holding retained bank for ${normalizedHoldSeconds} second(s) so you can inspect Chrome Task Manager...`);
+        await sleep(normalizedHoldSeconds * 1000);
+        updateMetrics("hold complete");
+      }
+
+      log("Interpretation: this retained bank is your empirical upper bound for this browser tab configuration. Production usage should stay below it.");
+    }
+
+    startBtn.addEventListener("click", () => {
+      runProbe().catch((error) => {
+        running = false;
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+        log(`Unhandled error: ${error.message || error}`);
+        updateMetrics("error");
+      });
+    });
+
+    stopBtn.addEventListener("click", () => {
+      stopRequested = true;
+      log("Stop requested. Finishing current allocation/touch first...");
+    });
+
+    releaseBtn.addEventListener("click", () => {
+      releaseAll().catch((error) => log(`Release error: ${error.message || error}`));
+    });
+
+    updateIsolationStatus();
+    updateRiskStatus();
+    updateMetrics("ready");
+    log("Ready. Open Chrome Task Manager, then start with 256 MiB shards and a 6 GiB target.");
+    log("Suggested workflow: run once to find the ceiling, then subtract at least 2 shards or ~15% for a safer production target.");
+  </script>
+</body>
+</html>

@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MVT 3e-lite - Rust Arrow IPC Diagnostic</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #121a33;
+      --panel-2: #0f1730;
+      --text: #e7ecff;
+      --muted: #a6b0d5;
+      --good: #66e3a4;
+      --warn: #ffd166;
+      --bad: #ff7b7b;
+      --border: #26345f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #0a0f1d, #0b1020 40%, #0d1327);
+      color: var(--text);
+    }
+    .wrap { max-width: 1180px; margin: 0 auto; padding: 32px 20px 48px; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { margin: 8px 0; color: var(--muted); }
+    textarea, input, button {
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+    }
+    textarea { width: 100%; min-height: 110px; resize: vertical; }
+    button { border: 0; background: linear-gradient(180deg, #1c6fff, #1758cc); font-weight: 700; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .secondary { background: #1a2447; border: 1px solid var(--border); }
+    .danger { background: linear-gradient(180deg, #c14444, #9e2f2f); }
+    .card {
+      background: rgba(18, 26, 51, .9);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      margin-top: 18px;
+      box-shadow: 0 8px 32px rgba(0,0,0,.22);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    .status {
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #101833;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
+    .status.good { border-color: rgba(102, 227, 164, .35); color: var(--good); }
+    .status.warn { border-color: rgba(255, 209, 102, .35); color: var(--warn); }
+    .status.bad { border-color: rgba(255, 123, 123, .35); color: var(--bad); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .metric {
+      background: #0e1630;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .metric .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .metric .value { margin-top: 8px; font-size: 22px; font-weight: 800; }
+    pre {
+      margin: 0;
+      background: #0b1228;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+      max-height: 360px;
+      color: #cfe0ff;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .small { font-size: 12px; color: var(--muted); }
+    #fileInput { display: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>MVT 3e-lite: Rust Arrow IPC Diagnostic</h1>
+    <p>
+      This page is a fast diagnostic for Rust Arrow IPC parsing in Wasm. It routes only a small subset of Arrow IPC batches into a shared <code>WebAssembly.Memory</code> bank and then times one Rust worker parsing them directly from the bank.
+    </p>
+
+    <div id="isolationStatus" class="status warn">Checking browser requirements...</div>
+    <div id="duckdbStatus" class="status warn">DuckDB-Wasm not initialized yet.</div>
+    <div id="rustStatus" class="status warn">Rust Arrow IPC module not loaded yet.</div>
+    <div id="fileStatus" class="status warn">No Parquet file selected yet.</div>
+    <div id="proofStatus" class="status warn">Diagnostic not started yet.</div>
+
+    <div class="card">
+      <strong>Setup</strong>
+      <div class="grid">
+        <label>
+          Shard size (MiB)
+          <input id="shardMiB" type="number" min="16" step="16" value="256" />
+        </label>
+        <label>
+          Target bank (GiB)
+          <input id="targetGiB" type="number" min="1" step="1" value="4" />
+        </label>
+        <label>
+          Route batch cap
+          <input id="routeBatchCap" type="number" min="1" step="1" value="10" />
+        </label>
+        <label>
+          Safety release shards
+          <input id="safetyRelease" type="number" min="0" step="1" value="2" />
+        </label>
+      </div>
+
+      <div class="row">
+        <button id="initDuckdbBtn">1. Init DuckDB-Wasm</button>
+        <button id="initRustBtn">2. Load Rust Arrow module</button>
+        <button id="pickFileBtn">3. Pick local .parquet</button>
+        <button id="allocateBtn">4. Allocate bank</button>
+        <button id="routeBtn">5. Route small subset</button>
+        <button id="proveBtn" class="secondary" disabled>6. Run diagnostic parse</button>
+        <button id="releaseBtn" class="danger">Release memory</button>
+      </div>
+      <input id="fileInput" type="file" accept=".parquet,application/octet-stream" />
+    </div>
+
+    <div class="card">
+      <strong>Query</strong>
+      <textarea id="sqlInput">SELECT feature_a, feature_b, feature_c, label FROM parquet_scan('selected.parquet');</textarea>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="label">Batches routed</div><div id="batchCountValue" class="value">0</div></div>
+      <div class="metric"><div class="label">Rows routed</div><div id="rowCountValue" class="value">0</div></div>
+      <div class="metric"><div class="label">Arrow bytes routed</div><div id="byteCountValue" class="value">0 B</div></div>
+      <div class="metric"><div class="label">Route time</div><div id="routeTimeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Compile+instantiate</div><div id="compileTimeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Parse time</div><div id="parseTimeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Total diagnostic time</div><div id="totalTimeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Chrome heap used*</div><div id="heapValue" class="value">-</div></div>
+    </div>
+
+    <div class="card">
+      <strong>Diagnostic result</strong>
+      <pre id="resultSummary"></pre>
+    </div>
+
+    <div class="card">
+      <strong>Log</strong>
+      <pre id="log"></pre>
+    </div>
+  </div>
+
+  <script type="module">
+    const DUCKDB_CDN = 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@latest/+esm';
+    const ARROW_CDN = 'https://cdn.jsdelivr.net/npm/apache-arrow@latest/+esm';
+    const RUST_WASM_URL = './wasm/rust_arrow_ipc.wasm';
+
+    const $ = (id) => document.getElementById(id);
+    const logEl = $('log');
+    const resultSummaryEl = $('resultSummary');
+    const isolationStatusEl = $('isolationStatus');
+    const duckdbStatusEl = $('duckdbStatus');
+    const rustStatusEl = $('rustStatus');
+    const fileStatusEl = $('fileStatus');
+    const proofStatusEl = $('proofStatus');
+    const fileInput = $('fileInput');
+
+    let duckdb = null;
+    let arrow = null;
+    let db = null;
+    let conn = null;
+    let rustWasmBytes = null;
+    let selectedFile = null;
+    let selectedHandle = null;
+    let memories = [];
+    let router = null;
+    let lastRouteElapsedMs = 0;
+    let lastCompileElapsedMs = 0;
+    let lastParseElapsedMs = 0;
+    let lastTotalElapsedMs = 0;
+    const registeredFileName = 'selected.parquet';
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      logEl.textContent += `[${time}] ${message}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes)) return '-';
+      const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+      let value = bytes;
+      let unitIndex = 0;
+      while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex++;
+      }
+      return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[unitIndex]}`;
+    }
+
+    function updateHeapMetric() {
+      if (performance.memory && Number.isFinite(performance.memory.usedJSHeapSize)) {
+        $('heapValue').textContent = formatBytes(performance.memory.usedJSHeapSize);
+      } else {
+        $('heapValue').textContent = 'n/a';
+      }
+    }
+
+    function updateMetrics() {
+      $('batchCountValue').textContent = router ? String(router.entries.length) : '0';
+      $('rowCountValue').textContent = router ? String(router.totalRows) : '0';
+      $('byteCountValue').textContent = router ? formatBytes(router.totalBytes) : '0 B';
+      $('routeTimeValue').textContent = lastRouteElapsedMs ? `${(lastRouteElapsedMs / 1000).toFixed(2)} s` : '-';
+      $('compileTimeValue').textContent = lastCompileElapsedMs ? `${lastCompileElapsedMs.toFixed(1)} ms` : '-';
+      $('parseTimeValue').textContent = lastParseElapsedMs ? `${lastParseElapsedMs.toFixed(1)} ms` : '-';
+      $('totalTimeValue').textContent = lastTotalElapsedMs ? `${(lastTotalElapsedMs / 1000).toFixed(2)} s` : '-';
+      updateHeapMetric();
+    }
+
+    function updateIsolationStatus() {
+      if (window.crossOriginIsolated) {
+        isolationStatusEl.className = 'status good';
+        isolationStatusEl.textContent = 'crossOriginIsolated = true. Shared WebAssembly.Memory is available.';
+      } else {
+        isolationStatusEl.className = 'status bad';
+        isolationStatusEl.textContent = 'crossOriginIsolated = false. This page requires COOP/COEP.';
+      }
+    }
+
+    class Router {
+      constructor(memories) {
+        this.memories = memories;
+        this.cursorShard = 0;
+        this.cursorOffset = 0;
+        this.entries = [];
+        this.totalRows = 0;
+        this.totalBytes = 0;
+      }
+      write(bytes, rowCount) {
+        while (true) {
+          const buffer = this.memories[this.cursorShard].buffer;
+          const space = buffer.byteLength - this.cursorOffset;
+          if (bytes.byteLength <= space) {
+            new Uint8Array(buffer, this.cursorOffset, bytes.byteLength).set(bytes);
+            this.entries.push({ rowCount, placement: { shardIndex: this.cursorShard, offset: this.cursorOffset, byteLength: bytes.byteLength } });
+            this.cursorOffset += bytes.byteLength;
+            this.totalRows += rowCount;
+            this.totalBytes += bytes.byteLength;
+            return;
+          }
+          this.cursorShard++;
+          this.cursorOffset = 0;
+          if (this.cursorShard >= this.memories.length) throw new Error('Out of shards');
+        }
+      }
+    }
+
+    async function initDuckDB() {
+      if (db && conn) return;
+      duckdb = await import(DUCKDB_CDN);
+      arrow = await import(ARROW_CDN);
+      const bundles = duckdb.getJsDelivrBundles();
+      const bundle = await duckdb.selectBundle(bundles);
+      const worker = await duckdb.createWorker(bundle.mainWorker);
+      db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(), worker);
+      await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+      conn = await db.connect();
+      duckdbStatusEl.className = 'status good';
+      duckdbStatusEl.textContent = 'DuckDB-Wasm initialized and ready.';
+      log('DuckDB-Wasm initialized successfully.');
+    }
+
+    async function initRustModule() {
+      const response = await fetch(RUST_WASM_URL);
+      if (!response.ok) throw new Error(`Failed to fetch ${RUST_WASM_URL}: ${response.status}`);
+      rustWasmBytes = await response.arrayBuffer();
+      rustStatusEl.className = 'status good';
+      rustStatusEl.textContent = 'Rust Arrow IPC module loaded.';
+      log('Rust Arrow IPC module loaded.');
+    }
+
+    async function pickParquetFile() {
+      if (!db) await initDuckDB();
+      selectedFile = null;
+      selectedHandle = null;
+      if (window.showOpenFilePicker) {
+        const [handle] = await window.showOpenFilePicker({ multiple: false, types: [{ description: 'Parquet files', accept: { 'application/octet-stream': ['.parquet'], 'application/x-parquet': ['.parquet'] } }] });
+        if (!handle) return;
+        selectedHandle = handle;
+        selectedFile = await handle.getFile();
+      } else {
+        fileInput.value = '';
+        fileInput.click();
+        await new Promise((resolve, reject) => {
+          fileInput.onchange = () => fileInput.files?.[0] ? resolve() : reject(new Error('No file selected'));
+        });
+        selectedFile = fileInput.files[0];
+      }
+      if (!selectedFile) throw new Error('No file selected.');
+      try { await db.dropFile?.(registeredFileName); } catch {}
+      try {
+        await db.registerFileHandle(registeredFileName, selectedFile, duckdb.DuckDBDataProtocol.BROWSER_FILEREADER, true);
+      } catch (error) {
+        if (selectedHandle && duckdb.DuckDBDataProtocol?.BROWSER_FSACCESS !== undefined) {
+          await db.registerFileHandle(registeredFileName, selectedHandle, duckdb.DuckDBDataProtocol.BROWSER_FSACCESS, true);
+        } else {
+          throw error;
+        }
+      }
+      fileStatusEl.className = 'status good';
+      fileStatusEl.textContent = `Selected file: ${selectedFile.name} (${formatBytes(selectedFile.size)}).`;
+      log(`Registered ${selectedFile.name}.`);
+    }
+
+    async function allocateBank() {
+      const shardMiB = Number($('shardMiB').value);
+      const targetGiB = Number($('targetGiB').value);
+      const safetyRelease = Math.trunc(Number($('safetyRelease').value));
+      const shardBytes = shardMiB * 1024 * 1024;
+      const targetBytes = targetGiB * 1024 * 1024 * 1024;
+      const pages = shardBytes / 65536;
+      memories = [];
+      router = null;
+      while (memories.reduce((sum, m) => sum + m.buffer.byteLength, 0) < targetBytes) {
+        try {
+          memories.push(new WebAssembly.Memory({ shared: true, initial: pages, maximum: pages }));
+        } catch (error) {
+          if (safetyRelease > 0) memories.splice(Math.max(0, memories.length - safetyRelease));
+          throw error;
+        }
+      }
+      router = new Router(memories);
+      log(`Allocated ${memories.length} shared wasm-memory shards.`);
+      updateMetrics();
+    }
+
+    function batchToColumnArrays(batch) {
+      const columns = {};
+      for (let index = 0; index < batch.schema.fields.length; index++) {
+        const field = batch.schema.fields[index];
+        const vector = typeof batch.getChildAt === 'function' ? batch.getChildAt(index) : batch.getChild(field.name);
+        columns[field.name] = typeof vector.toArray === 'function' ? vector.toArray() : Array.from({ length: batch.numRows }, (_, row) => vector.get(row));
+      }
+      return columns;
+    }
+
+    function batchToIPC(batch) {
+      const table = arrow.tableFromArrays(batchToColumnArrays(batch));
+      return arrow.tableToIPC(table, 'stream');
+    }
+
+    async function routeSmallSubset() {
+      const sql = $('sqlInput').value.trim();
+      const cap = Math.max(1, Math.trunc(Number($('routeBatchCap').value) || 10));
+      router = new Router(memories);
+      const started = performance.now();
+      let count = 0;
+      const reader = await conn.send(sql);
+      for await (const batch of reader) {
+        if (count >= cap) break;
+        router.write(batchToIPC(batch), batch.numRows);
+        count++;
+      }
+      lastRouteElapsedMs = performance.now() - started;
+      $('proveBtn').disabled = !rustWasmBytes || !router.entries.length;
+      proofStatusEl.className = 'status warn';
+      proofStatusEl.textContent = `Routed ${router.entries.length} batch(es). Ready for diagnostic parse.`;
+      log(`Routed ${router.entries.length} batch(es), ${router.totalRows} rows, ${formatBytes(router.totalBytes)} Arrow IPC.`);
+      updateMetrics();
+    }
+
+    function createWorkerUrl() {
+      const source = `
+        self.onmessage = async (event) => {
+          const { wasmBytes, memory, entry } = event.data;
+          try {
+            const compileStart = performance.now();
+            const module = await WebAssembly.compile(wasmBytes);
+            const instance = await WebAssembly.instantiate(module, { env: { memory } });
+            const compileEnd = performance.now();
+            const parseStart = performance.now();
+            const rc = instance.exports.parse_arrow_ipc_batch(entry.placement.offset, entry.placement.byteLength);
+            const parseEnd = performance.now();
+            if (rc !== 0) throw new Error('parse_arrow_ipc_batch returned non-zero status');
+            self.postMessage({
+              ok: true,
+              compileMs: compileEnd - compileStart,
+              parseMs: parseEnd - parseStart,
+              rowCount: Number(instance.exports.last_row_count()),
+              sumFeatureA: Number(instance.exports.last_sum_feature_a()),
+              sumFeatureB: Number(instance.exports.last_sum_feature_b()),
+              sumFeatureC: Number(instance.exports.last_sum_feature_c()),
+              label0: Number(instance.exports.last_label_0()),
+              label1: Number(instance.exports.last_label_1())
+            });
+          } catch (error) {
+            self.postMessage({ ok: false, error: error.message || String(error) });
+          }
+        };
+      `;
+      return URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    }
+
+    async function runDiagnostic() {
+      if (!router || !router.entries.length) throw new Error('No routed batches available.');
+      const entry = router.entries[0];
+      const workerUrl = createWorkerUrl();
+      const started = performance.now();
+      const result = await new Promise((resolve, reject) => {
+        const worker = new Worker(workerUrl);
+        worker.onmessage = (event) => {
+          worker.terminate();
+          resolve(event.data);
+        };
+        worker.onerror = (error) => {
+          worker.terminate();
+          reject(error);
+        };
+        worker.postMessage({ wasmBytes: rustWasmBytes, memory: memories[entry.placement.shardIndex], entry });
+      }).finally(() => URL.revokeObjectURL(workerUrl));
+
+      if (!result.ok) throw new Error(result.error);
+      lastCompileElapsedMs = result.compileMs;
+      lastParseElapsedMs = result.parseMs;
+      lastTotalElapsedMs = performance.now() - started;
+      proofStatusEl.className = 'status good';
+      proofStatusEl.textContent = 'Diagnostic parse completed.';
+      resultSummaryEl.textContent = JSON.stringify(result, null, 2);
+      log(`Diagnostic done. compile=${result.compileMs.toFixed(1)}ms parse=${result.parseMs.toFixed(1)}ms rows=${result.rowCount}`);
+      updateMetrics();
+    }
+
+    async function releaseAll() {
+      memories = [];
+      router = null;
+      lastRouteElapsedMs = 0;
+      lastCompileElapsedMs = 0;
+      lastParseElapsedMs = 0;
+      lastTotalElapsedMs = 0;
+      resultSummaryEl.textContent = 'No result yet.';
+      $('proveBtn').disabled = true;
+      updateMetrics();
+      log('Released memory.');
+    }
+
+    $('initDuckdbBtn').addEventListener('click', () => initDuckDB().catch((e) => { duckdbStatusEl.className='status bad'; duckdbStatusEl.textContent=e.message; log(e.message); }));
+    $('initRustBtn').addEventListener('click', () => initRustModule().catch((e) => { rustStatusEl.className='status bad'; rustStatusEl.textContent=e.message; log(e.message); }));
+    $('pickFileBtn').addEventListener('click', () => pickParquetFile().catch((e) => { fileStatusEl.className='status bad'; fileStatusEl.textContent=e.message; log(e.message); }));
+    $('allocateBtn').addEventListener('click', () => allocateBank().catch((e) => log(`Allocation failed: ${e.message}`)));
+    $('routeBtn').addEventListener('click', () => routeSmallSubset().catch((e) => { proofStatusEl.className='status bad'; proofStatusEl.textContent=e.message; log(e.message); }));
+    $('proveBtn').addEventListener('click', () => runDiagnostic().catch((e) => { proofStatusEl.className='status bad'; proofStatusEl.textContent=e.message; log(e.message); }));
+    $('releaseBtn').addEventListener('click', () => releaseAll().catch((e) => log(e.message)));
+
+    updateIsolationStatus();
+    updateMetrics();
+    resultSummaryEl.textContent = 'No result yet.';
+    log('Ready. Route 10 small batches first, then run the one-batch Rust Arrow diagnostic parse.');
+  </script>
+</body>
+</html>

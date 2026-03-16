@@ -1,0 +1,14 @@
+# Rust / cargo
+**/target/
+Cargo.lock
+
+# Large generated data
+/data/*.parquet
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+/tmp/

@@ -1,0 +1,689 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MVT 2 - 4 Cores, 10 Minutes, 6 GiB</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #121a33;
+      --panel-2: #0f1730;
+      --text: #e7ecff;
+      --muted: #a6b0d5;
+      --good: #66e3a4;
+      --warn: #ffd166;
+      --bad: #ff7b7b;
+      --border: #26345f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #0a0f1d, #0b1020 40%, #0d1327);
+      color: var(--text);
+    }
+    .wrap {
+      max-width: 1150px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { margin: 8px 0; color: var(--muted); }
+    .card {
+      background: rgba(18, 26, 51, 0.9);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      margin-top: 18px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.22);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+    label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    input, button {
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+    }
+    button {
+      background: linear-gradient(180deg, #1c6fff, #1758cc);
+      border: 0;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .secondary { background: #1a2447; border: 1px solid var(--border); }
+    .danger { background: linear-gradient(180deg, #c14444, #9e2f2f); }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    .status {
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #101833;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
+    .status.good { border-color: rgba(102, 227, 164, 0.35); color: var(--good); }
+    .status.warn { border-color: rgba(255, 209, 102, 0.35); color: var(--warn); }
+    .status.bad { border-color: rgba(255, 123, 123, 0.35); color: var(--bad); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .metric {
+      background: #0e1630;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .metric .label {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .metric .value {
+      margin-top: 8px;
+      font-size: 22px;
+      font-weight: 800;
+    }
+    pre {
+      margin: 0;
+      background: #0b1228;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+      max-height: 360px;
+      color: #cfe0ff;
+    }
+    .small { font-size: 12px; color: var(--muted); }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>MVT 2: Persistence + 4 CPU Workers + 6 GiB</h1>
+    <p>
+      This prototype combines the anti-throttling anchor with a sustained compute workload:
+      a 6 GiB shared-memory bank, 4 CPU-bound Web Workers, 10 minutes of work, heartbeat logs,
+      Document Picture-in-Picture, and Wake Lock.
+    </p>
+
+    <div id="isolationStatus" class="status warn">Checking browser requirements...</div>
+    <div id="pipStatus" class="status warn">PiP window not opened yet.</div>
+    <div id="wakeLockStatus" class="status warn">Wake lock not requested yet.</div>
+
+    <div class="card">
+      <strong>Test setup</strong>
+      <div class="grid">
+        <label>
+          Shard size (MiB)
+          <input id="shardMiB" type="number" min="16" step="16" value="256" />
+        </label>
+        <label>
+          Target total (GiB)
+          <input id="targetGiB" type="number" min="1" step="1" value="6" />
+        </label>
+        <label>
+          Worker count
+          <input id="workerCount" type="number" min="1" max="32" step="1" value="4" />
+        </label>
+        <label>
+          Duration (minutes)
+          <input id="durationMinutes" type="number" min="1" step="1" value="10" />
+        </label>
+        <label>
+          Heartbeat interval (seconds)
+          <input id="heartbeatSeconds" type="number" min="1" step="1" value="1" />
+        </label>
+        <label>
+          Safety release shards on allocation failure
+          <input id="safetyRelease" type="number" min="0" step="1" value="2" />
+        </label>
+      </div>
+
+      <div class="row">
+        <button id="openPipBtn">1. Open PiP + request wake lock</button>
+        <button id="startBtn">2. Allocate + start 10 min test</button>
+        <button id="stopBtn" class="secondary" disabled>Stop</button>
+        <button id="releaseBtn" class="danger">Release memory</button>
+      </div>
+
+      <p class="small">
+        Recommended validation flow: open PiP, start the test, confirm ~6 GiB memory and high CPU in Chrome Task Manager,
+        then minimize the main window for several minutes. On restore, check heartbeat gap statistics.
+      </p>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="label">Allocated shards</div><div id="shardCountValue" class="value">0</div></div>
+      <div class="metric"><div class="label">Total allocated</div><div id="totalAllocatedValue" class="value">0 B</div></div>
+      <div class="metric"><div class="label">Workers running</div><div id="workersRunningValue" class="value">0</div></div>
+      <div class="metric"><div class="label">Elapsed</div><div id="elapsedValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Expected heartbeats/worker</div><div id="expectedHeartbeatsValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Worst heartbeat gap</div><div id="worstGapValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Chrome heap used*</div><div id="heapValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Last result</div><div id="lastResultValue" class="value">ready</div></div>
+    </div>
+
+    <div class="card">
+      <strong>Per-worker heartbeat summary</strong>
+      <pre id="summary"></pre>
+      <p class="small">
+        Success target: each worker should produce roughly one heartbeat per second for the duration,
+        with no large pause after minimizing the main window while PiP + wake lock are active.
+      </p>
+    </div>
+
+    <div class="card">
+      <strong>Log</strong>
+      <pre id="log"></pre>
+      <p class="small">
+        * <code>performance.memory</code> is JS heap only. Use Chrome Task Manager and/or your OS monitor for real memory + CPU footprint.
+      </p>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const logEl = $("log");
+    const summaryEl = $("summary");
+    const isolationStatusEl = $("isolationStatus");
+    const pipStatusEl = $("pipStatus");
+    const wakeLockStatusEl = $("wakeLockStatus");
+    const openPipBtn = $("openPipBtn");
+    const startBtn = $("startBtn");
+    const stopBtn = $("stopBtn");
+    const releaseBtn = $("releaseBtn");
+
+    const shardMiBInput = $("shardMiB");
+    const targetGiBInput = $("targetGiB");
+    const workerCountInput = $("workerCount");
+    const durationMinutesInput = $("durationMinutes");
+    const heartbeatSecondsInput = $("heartbeatSeconds");
+    const safetyReleaseInput = $("safetyRelease");
+
+    let bank = [];
+    let workers = [];
+    let stopRequested = false;
+    let running = false;
+    let pipWindowRef = null;
+    let wakeLockSentinel = null;
+    let metricPoll = null;
+    let testStartTime = 0;
+    let workerStats = new Map();
+    let currentRunReject = null;
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      logEl.textContent += `[${time}] ${message}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes)) return "-";
+      const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+      let value = bytes;
+      let unitIndex = 0;
+      while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex++;
+      }
+      return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[unitIndex]}`;
+    }
+
+    function formatNumber(value) {
+      if (!Number.isFinite(value)) return "-";
+      return new Intl.NumberFormat().format(value);
+    }
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function totalAllocatedBytes() {
+      return bank.reduce((sum, sab) => sum + sab.byteLength, 0);
+    }
+
+    function updateHeapMetric() {
+      if (performance.memory && Number.isFinite(performance.memory.usedJSHeapSize)) {
+        $("heapValue").textContent = formatBytes(performance.memory.usedJSHeapSize);
+      } else {
+        $("heapValue").textContent = "n/a";
+      }
+    }
+
+    function updateMetrics(lastResult = null) {
+      $("shardCountValue").textContent = formatNumber(bank.length);
+      $("totalAllocatedValue").textContent = formatBytes(totalAllocatedBytes());
+      $("workersRunningValue").textContent = formatNumber(workers.length);
+      if (testStartTime && running) {
+        $("elapsedValue").textContent = `${((performance.now() - testStartTime) / 1000).toFixed(1)} s`;
+      }
+      if (lastResult !== null) {
+        $("lastResultValue").textContent = lastResult;
+      }
+      let worstGap = 0;
+      for (const stat of workerStats.values()) {
+        if (stat.maxGapMs > worstGap) worstGap = stat.maxGapMs;
+      }
+      $("worstGapValue").textContent = worstGap ? `${worstGap.toFixed(0)} ms` : "-";
+      updateHeapMetric();
+      renderSummary();
+    }
+
+    function renderSummary() {
+      if (workerStats.size === 0) {
+        summaryEl.textContent = "No worker heartbeats yet.";
+        return;
+      }
+      const lines = [];
+      const sorted = [...workerStats.entries()].sort((a, b) => a[0] - b[0]);
+      for (const [workerId, stat] of sorted) {
+        lines.push(
+          `worker ${workerId}: heartbeats=${stat.heartbeats}, maxGap=${stat.maxGapMs.toFixed(0)} ms, checksum=${stat.lastChecksum}, completed=${stat.completed ? 'yes' : 'no'}`
+        );
+      }
+      summaryEl.textContent = lines.join("\n");
+    }
+
+    function updateIsolationStatus() {
+      if (!window.crossOriginIsolated) {
+        isolationStatusEl.className = "status bad";
+        isolationStatusEl.textContent = [
+          "crossOriginIsolated = false. This test requires SharedArrayBuffer.",
+          "Serve with:",
+          "Cross-Origin-Opener-Policy: same-origin",
+          "Cross-Origin-Embedder-Policy: require-corp"
+        ].join("\n");
+        return;
+      }
+      isolationStatusEl.className = "status good";
+      isolationStatusEl.textContent = "crossOriginIsolated = true. SharedArrayBuffer is available.";
+    }
+
+    function touchShard(sab) {
+      const view = new Uint8Array(sab);
+      const pageStride = 4096;
+      for (let offset = 0; offset < view.length; offset += pageStride) {
+        view[offset] = (view[offset] + 1) & 0xff;
+      }
+      if (view.length > 0) {
+        view[view.length - 1] = (view[view.length - 1] + 1) & 0xff;
+      }
+    }
+
+    async function openPipAndWakeLock() {
+      if (!("documentPictureInPicture" in window)) {
+        pipStatusEl.className = "status bad";
+        pipStatusEl.textContent = "Document Picture-in-Picture is not available in this browser.";
+        return;
+      }
+
+      try {
+        pipWindowRef = await window.documentPictureInPicture.requestWindow({ width: 360, height: 180 });
+        const doc = pipWindowRef.document;
+        doc.body.innerHTML = "";
+        doc.body.style.margin = "0";
+        doc.body.style.font = '14px system-ui, sans-serif';
+        doc.body.style.background = '#0f1730';
+        doc.body.style.color = '#e7ecff';
+        doc.body.style.display = 'flex';
+        doc.body.style.flexDirection = 'column';
+        doc.body.style.alignItems = 'center';
+        doc.body.style.justifyContent = 'center';
+        doc.body.style.gap = '10px';
+        doc.body.innerHTML = `
+          <div style="font-weight:700">MVT 2 persistence anchor</div>
+          <div id="pipText" style="opacity:.9;text-align:center;padding:0 12px">Keep this PiP window open while the main window is minimized.</div>
+        `;
+
+        pipStatusEl.className = "status good";
+        pipStatusEl.textContent = "PiP window opened. Keep it visible while the test runs.";
+
+        try {
+          if (pipWindowRef.navigator?.wakeLock?.request) {
+            wakeLockSentinel = await pipWindowRef.navigator.wakeLock.request('screen');
+          } else if (navigator.wakeLock?.request) {
+            wakeLockSentinel = await navigator.wakeLock.request('screen');
+          } else {
+            throw new Error('Wake Lock API unavailable');
+          }
+          wakeLockStatusEl.className = "status good";
+          wakeLockStatusEl.textContent = "Screen wake lock acquired.";
+          wakeLockSentinel.addEventListener?.('release', () => {
+            wakeLockStatusEl.className = "status warn";
+            wakeLockStatusEl.textContent = "Wake lock was released.";
+          });
+        } catch (error) {
+          wakeLockStatusEl.className = "status warn";
+          wakeLockStatusEl.textContent = `Wake lock request failed: ${error.message}`;
+        }
+      } catch (error) {
+        pipStatusEl.className = "status bad";
+        pipStatusEl.textContent = `PiP request failed: ${error.message}`;
+      }
+    }
+
+    async function allocateMemoryBank(shardBytes, targetBytes, safetyRelease) {
+      bank = [];
+      let attempts = 0;
+      while (totalAllocatedBytes() < targetBytes) {
+        attempts++;
+        log(`Allocating shard ${attempts}: ${formatBytes(shardBytes)}...`);
+        let sab;
+        try {
+          sab = new SharedArrayBuffer(shardBytes);
+          touchShard(sab);
+          bank.push(sab);
+          log(`Retained shard ${bank.length}. Total bank: ${formatBytes(totalAllocatedBytes())}.`);
+          updateMetrics("allocating");
+          await sleep(30);
+        } catch (error) {
+          log(`Allocation failed after ${bank.length} shard(s): ${error.message}`);
+          if (safetyRelease > 0) {
+            const releaseCount = Math.min(safetyRelease, bank.length);
+            for (let i = 0; i < releaseCount; i++) bank.pop();
+            log(`Safety release applied: removed ${releaseCount} shard(s). Retained bank: ${formatBytes(totalAllocatedBytes())}.`);
+          }
+          throw error;
+        }
+      }
+    }
+
+    function cleanupWorkers() {
+      for (const worker of workers) worker.terminate();
+      workers = [];
+      updateMetrics();
+    }
+
+    async function releaseAll() {
+      stopRequested = true;
+      running = false;
+      cleanupWorkers();
+      bank = [];
+      workerStats.clear();
+      summaryEl.textContent = "No worker heartbeats yet.";
+      updateMetrics("released all");
+      log("Released all worker references and memory shards.");
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    }
+
+    function createWorkerBlobUrl() {
+      const source = `
+        function shouldHeartbeat(now, nextHeartbeatAt) {
+          return now >= nextHeartbeatAt;
+        }
+
+        self.onmessage = (event) => {
+          const { workerId, shards, durationMs, heartbeatMs } = event.data;
+          const views = shards.map((sab) => new Int32Array(sab));
+          const startedAt = performance.now();
+          const endAt = startedAt + durationMs;
+          let nextHeartbeatAt = startedAt + heartbeatMs;
+          let lastHeartbeatAt = startedAt;
+          let heartbeatCount = 0;
+          let checksum = 0;
+          let blocksProcessed = 0;
+          const blockInts = 262144;
+
+          outer: while (performance.now() < endAt) {
+            for (let shardIndex = 0; shardIndex < views.length; shardIndex++) {
+              const view = views[shardIndex];
+              for (let offset = 0; offset < view.length; offset += blockInts) {
+                const end = Math.min(offset + blockInts, view.length);
+                for (let i = offset; i < end; i++) {
+                  checksum = (checksum + view[i]) | 0;
+                }
+                blocksProcessed++;
+                const now = performance.now();
+                if (shouldHeartbeat(now, nextHeartbeatAt)) {
+                  heartbeatCount++;
+                  self.postMessage({
+                    type: 'heartbeat',
+                    workerId,
+                    workerNow: now,
+                    sinceLastHeartbeatMs: now - lastHeartbeatAt,
+                    heartbeats: heartbeatCount,
+                    checksum,
+                    blocksProcessed
+                  });
+                  lastHeartbeatAt = now;
+                  nextHeartbeatAt += heartbeatMs;
+                }
+                if (now >= endAt) {
+                  break outer;
+                }
+              }
+            }
+          }
+
+          const endedAt = performance.now();
+          self.postMessage({
+            type: 'done',
+            workerId,
+            heartbeats: heartbeatCount,
+            checksum,
+            durationMs: endedAt - startedAt,
+            blocksProcessed
+          });
+        };
+      `;
+      return URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+    }
+
+    async function runTest() {
+      if (!window.crossOriginIsolated) {
+        updateIsolationStatus();
+        log("Blocked: SharedArrayBuffer requires cross-origin isolation.");
+        return;
+      }
+      if (running) return;
+
+      const shardMiB = Number(shardMiBInput.value);
+      const targetGiB = Number(targetGiBInput.value);
+      const workerCount = Number(workerCountInput.value);
+      const durationMinutes = Number(durationMinutesInput.value);
+      const heartbeatSeconds = Number(heartbeatSecondsInput.value);
+      const safetyRelease = Number(safetyReleaseInput.value);
+
+      if (!Number.isFinite(shardMiB) || shardMiB <= 0) return log("Invalid shard size.");
+      if (!Number.isFinite(targetGiB) || targetGiB <= 0) return log("Invalid target total.");
+      if (!Number.isFinite(workerCount) || workerCount <= 0) return log("Invalid worker count.");
+      if (!Number.isFinite(durationMinutes) || durationMinutes <= 0) return log("Invalid duration.");
+      if (!Number.isFinite(heartbeatSeconds) || heartbeatSeconds <= 0) return log("Invalid heartbeat interval.");
+      if (!Number.isFinite(safetyRelease) || safetyRelease < 0) return log("Invalid safety release.");
+
+      const shardBytes = shardMiB * 1024 * 1024;
+      const targetBytes = targetGiB * 1024 * 1024 * 1024;
+      const durationMs = Math.trunc(durationMinutes * 60 * 1000);
+      const heartbeatMs = Math.trunc(heartbeatSeconds * 1000);
+      const expectedHeartbeats = Math.floor(durationMs / heartbeatMs);
+
+      $("expectedHeartbeatsValue").textContent = formatNumber(expectedHeartbeats);
+
+      stopRequested = false;
+      running = true;
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      workerStats.clear();
+      logEl.textContent = "";
+      summaryEl.textContent = "No worker heartbeats yet.";
+      updateMetrics("starting");
+
+      log(`Starting MVT 2 with ${workerCount} worker(s), ${targetGiB} GiB target memory, ${durationMinutes} minute(s), ${heartbeatSeconds}s heartbeats.`);
+      log("Tip: once workers are running, open Chrome Task Manager, then minimize the main window and leave PiP open.");
+
+      try {
+        await allocateMemoryBank(shardBytes, targetBytes, Math.trunc(safetyRelease));
+      } catch (error) {
+        running = false;
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+        updateMetrics("allocation failed");
+        log("Allocation phase failed. Reduce targetGiB or shard size, or close other apps/tabs.");
+        return;
+      }
+
+      const shardBuckets = Array.from({ length: workerCount }, () => []);
+      bank.forEach((sab, index) => shardBuckets[index % workerCount].push(sab));
+
+      const workerUrl = createWorkerBlobUrl();
+      testStartTime = performance.now();
+      if (metricPoll) clearInterval(metricPoll);
+      metricPoll = setInterval(() => updateMetrics(running ? "running" : "idle"), 1000);
+
+      let completedWorkers = 0;
+      let failed = false;
+
+      await new Promise((resolve, reject) => {
+        currentRunReject = reject;
+        for (let workerId = 0; workerId < workerCount; workerId++) {
+          const worker = new Worker(workerUrl);
+          workers.push(worker);
+          workerStats.set(workerId, {
+            heartbeats: 0,
+            maxGapMs: 0,
+            lastChecksum: 0,
+            completed: false
+          });
+
+          worker.onmessage = (event) => {
+            const data = event.data;
+            if (stopRequested) return;
+            const stat = workerStats.get(data.workerId);
+            if (!stat) return;
+
+            if (data.type === 'heartbeat') {
+              stat.heartbeats = data.heartbeats;
+              stat.lastChecksum = data.checksum;
+              stat.maxGapMs = Math.max(stat.maxGapMs, data.sinceLastHeartbeatMs);
+              updateMetrics("running");
+              return;
+            }
+
+            if (data.type === 'done') {
+              stat.heartbeats = data.heartbeats;
+              stat.lastChecksum = data.checksum;
+              stat.completed = true;
+              completedWorkers++;
+              log(`Worker ${data.workerId} completed in ${(data.durationMs / 1000).toFixed(1)} s with ${data.heartbeats} heartbeat(s), checksum=${data.checksum}, blocks=${data.blocksProcessed}.`);
+              updateMetrics("worker done");
+              if (completedWorkers === workerCount) resolve();
+            }
+          };
+
+          worker.onerror = (error) => {
+            failed = true;
+            reject(error);
+          };
+
+          worker.postMessage({
+            workerId,
+            shards: shardBuckets[workerId],
+            durationMs,
+            heartbeatMs
+          });
+        }
+      }).catch((error) => {
+        failed = true;
+        log(`Worker failure: ${error.message || error}`);
+        throw error;
+      }).finally(() => {
+        currentRunReject = null;
+        URL.revokeObjectURL(workerUrl);
+      });
+
+      running = false;
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      clearInterval(metricPoll);
+      metricPoll = null;
+
+      const worstGap = Math.max(0, ...[...workerStats.values()].map((stat) => stat.maxGapMs));
+      const allDone = [...workerStats.values()].every((stat) => stat.completed);
+      const minHeartbeats = Math.min(...[...workerStats.values()].map((stat) => stat.heartbeats));
+      const success = !failed && allDone && minHeartbeats >= Math.max(1, expectedHeartbeats - 3);
+
+      if (success) {
+        log(`SUCCESS: all workers ran for ~${durationMinutes} minute(s), retained ${formatBytes(totalAllocatedBytes())}, and heartbeat cadence stayed near ${heartbeatSeconds}s.`);
+        if (worstGap > heartbeatMs * 2.5) {
+          log(`Warning: worst gap was ${worstGap.toFixed(0)} ms. Review whether the main window was minimized during that interval.`);
+        }
+        updateMetrics("success");
+      } else {
+        log(`FAIL/INCONCLUSIVE: expected ~${expectedHeartbeats} heartbeat(s) per worker, minimum observed was ${minHeartbeats}. Worst gap was ${worstGap.toFixed(0)} ms.`);
+        updateMetrics("inconclusive");
+      }
+    }
+
+    openPipBtn.addEventListener("click", () => {
+      openPipAndWakeLock().catch((error) => log(`PiP/WakeLock error: ${error.message || error}`));
+    });
+
+    startBtn.addEventListener("click", () => {
+      runTest().catch((error) => {
+        running = false;
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+        cleanupWorkers();
+        updateMetrics("error");
+        log(`Unhandled error: ${error.message || error}`);
+      });
+    });
+
+    stopBtn.addEventListener("click", () => {
+      stopRequested = true;
+      running = false;
+      cleanupWorkers();
+      if (currentRunReject) {
+        currentRunReject(new Error("Stopped by user"));
+        currentRunReject = null;
+      }
+      updateMetrics("stopped");
+      log("Stop requested by user.");
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    });
+
+    releaseBtn.addEventListener("click", () => {
+      releaseAll().catch((error) => log(`Release error: ${error.message || error}`));
+    });
+
+    document.addEventListener('visibilitychange', async () => {
+      if (document.visibilityState === 'visible' && !wakeLockSentinel && navigator.wakeLock?.request) {
+        try {
+          wakeLockSentinel = await navigator.wakeLock.request('screen');
+          wakeLockStatusEl.className = "status good";
+          wakeLockStatusEl.textContent = "Wake lock re-acquired after visibility change.";
+        } catch {
+          // ignore
+        }
+      }
+    });
+
+    updateIsolationStatus();
+    updateMetrics("ready");
+    log("Ready. Click 'Open PiP + request wake lock' first, then start the 10-minute 6 GiB / 4-worker test.");
+  </script>
+</body>
+</html>
