@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Parquet-Wasm -> Bank -> Polars Workers</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1020; --panel:#121a33; --panel-2:#0f1730; --text:#e7ecff; --muted:#a6b0d5; --good:#66e3a4; --warn:#ffd166; --bad:#ff7b7b; --border:#26345f; }
+    * { box-sizing:border-box; }
+    body { margin:0; font:14px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:linear-gradient(180deg,#0a0f1d,#0b1020 40%,#0d1327); color:var(--text); }
+    .wrap { max-width:1260px; margin:0 auto; padding:32px 20px 48px; }
+    h1 { margin:0 0 8px; font-size:28px; }
+    p { margin:8px 0; color:var(--muted); }
+    .card { background:rgba(18,26,51,.9); border:1px solid var(--border); border-radius:16px; padding:18px; margin-top:18px; box-shadow:0 8px 32px rgba(0,0,0,.22); }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; margin-top:14px; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; }
+    label { display:flex; flex-direction:column; gap:6px; color:var(--muted); font-weight:600; }
+    input,button { border-radius:10px; border:1px solid var(--border); background:var(--panel-2); color:var(--text); padding:10px 12px; font:inherit; }
+    button { border:0; background:linear-gradient(180deg,#1c6fff,#1758cc); font-weight:700; cursor:pointer; }
+    button:disabled { opacity:.6; cursor:not-allowed; }
+    .danger { background:linear-gradient(180deg,#c14444,#9e2f2f); }
+    .status { padding:12px 14px; border-radius:12px; border:1px solid var(--border); background:#101833; margin-top:12px; white-space:pre-wrap; }
+    .status.good { border-color:rgba(102,227,164,.35); color:var(--good); }
+    .status.warn { border-color:rgba(255,209,102,.35); color:var(--warn); }
+    .status.bad { border-color:rgba(255,123,123,.35); color:var(--bad); }
+    .metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; margin-top:16px; }
+    .metric { background:#0e1630; border:1px solid var(--border); border-radius:12px; padding:12px; }
+    .metric .label { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+    .metric .value { margin-top:8px; font-size:22px; font-weight:800; }
+    pre { margin:0; background:#0b1228; border:1px solid var(--border); border-radius:12px; padding:14px; overflow:auto; max-height:360px; color:#cfe0ff; white-space:pre-wrap; word-break:break-word; }
+    .small { font-size:12px; color:var(--muted); }
+    #fileInput { display:none; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Parquet-Wasm -> Bank -> Polars Workers</h1>
+  <p>
+    This is the closest currently implementable non-DuckDB Rust/Wasm ingest alternative. Instead of DuckDB-Wasm scanning the Parquet file, <code>parquet-wasm</code> reads the local file in Rust/Wasm, emits Arrow RecordBatches, routes selected columns into the shared bank, and then runs fresh live workers and fresh Polars workers over the routed bank.
+  </p>
+  <p class="small">
+    Important nuance: this is <strong>not</strong> Polars native Parquet IO yet. It is the strongest practical "no DuckDB" ingest/routing follow-on with a Rust/Wasm parquet reader in the browser.
+  </p>
+
+  <div id="isolationStatus" class="status warn">Checking browser requirements...</div>
+  <div id="parquetStatus" class="status warn">Parquet-Wasm not initialized yet.</div>
+  <div id="fileStatus" class="status warn">No Parquet file selected yet.</div>
+  <div id="status" class="status warn">Ready. Route real typed data into the shared bank with Parquet-Wasm, then run live + Polars workers and the mutation proof.</div>
+
+  <div class="card">
+    <strong>Setup</strong>
+    <div class="grid">
+      <label>Shard size (MiB)<input id="shardMiBInput" type="number" min="16" step="16" value="256" /></label>
+      <label>Target bank (GiB)<input id="targetGiBInput" type="number" min="1" step="1" value="12" /></label>
+      <label>Worker count<input id="workerCountInput" type="number" min="1" max="16" step="1" value="4" /></label>
+      <label>Batch size<input id="batchSizeInput" type="number" min="256" step="256" value="2048" /></label>
+      <label>Mutation delta<input id="deltaInput" type="number" step="1" value="1000" /></label>
+    </div>
+    <div class="row">
+      <button id="initBtn">1. Init Parquet-Wasm</button>
+      <button id="pickFileBtn">2. Pick local .parquet</button>
+      <button id="allocateBtn">3. Allocate shared bank</button>
+      <button id="routeBtn">4. Route typed columns</button>
+      <button id="runBtn">5. Run live + Polars proof</button>
+      <button id="releaseBtn" class="danger">Release bank</button>
+    </div>
+    <input id="fileInput" type="file" accept=".parquet,application/octet-stream" />
+  </div>
+
+  <div class="metrics">
+    <div class="metric"><div class="label">Shards</div><div id="shardCountValue" class="value">-</div></div>
+    <div class="metric"><div class="label">Bank size</div><div id="bankSizeValue" class="value">-</div></div>
+    <div class="metric"><div class="label">Used bytes</div><div id="usedBytesValue" class="value">-</div></div>
+    <div class="metric"><div class="label">Routed batches</div><div id="batchCountValue" class="value">-</div></div>
+    <div class="metric"><div class="label">Routed rows</div><div id="rowCountValue" class="value">-</div></div>
+    <div class="metric"><div class="label">Route time</div><div id="routeTimeValue" class="value">-</div></div>
+    <div class="metric"><div class="label">Live wall</div><div id="liveWallValue" class="value">-</div></div>
+    <div class="metric"><div class="label">Polars wall</div><div id="polarsWallValue" class="value">-</div></div>
+    <div class="metric"><div class="label">Polars init max</div><div id="polarsInitValue" class="value">-</div></div>
+    <div class="metric"><div class="label">Polars fill max</div><div id="polarsFillValue" class="value">-</div></div>
+    <div class="metric"><div class="label">Polars compute max</div><div id="polarsComputeValue" class="value">-</div></div>
+    <div class="metric"><div class="label">Live sum</div><div id="liveSumValue" class="value">-</div></div>
+    <div class="metric"><div class="label">Polars sum</div><div id="polarsSumValue" class="value">-</div></div>
+    <div class="metric"><div class="label">Expected delta</div><div id="expectedDeltaValue" class="value">-</div></div>
+    <div class="metric"><div class="label">Observed live delta</div><div id="liveDeltaValue" class="value">-</div></div>
+    <div class="metric"><div class="label">Observed Polars delta</div><div id="polarsDeltaValue" class="value">-</div></div>
+    <div class="metric"><div class="label">Chrome heap used*</div><div id="heapValue" class="value">-</div></div>
+  </div>
+
+  <div class="card"><strong>Bank manifest</strong><pre id="manifest"></pre></div>
+  <div class="card"><strong>Result</strong><pre id="result"></pre></div>
+  <div class="card"><strong>Log</strong><pre id="log"></pre></div>
+</div>
+
+<script type="module">
+const PARQUET_WASM_URL='https://cdn.jsdelivr.net/npm/parquet-wasm/esm/parquet_wasm.js';
+const ARROW_CDN='https://cdn.jsdelivr.net/npm/apache-arrow@latest/+esm';
+const POLARS_MODULE_URL=new URL('./polars-web/polars_spike.js', import.meta.url).href;
+const POLARS_WASM_URL=new URL('./polars-web/polars_spike_bg.wasm', import.meta.url).href;
+const $=(id)=>document.getElementById(id);
+const isolationStatusEl=$('isolationStatus'); const parquetStatusEl=$('parquetStatus'); const fileStatusEl=$('fileStatus'); const statusEl=$('status'); const manifestEl=$('manifest'); const resultEl=$('result'); const logEl=$('log'); const fileInput=$('fileInput');
+let parquetWasm=null, arrow=null, selectedFile=null, memories=[], bank=null;
+function log(message){const t=new Date().toLocaleTimeString(); logEl.textContent += `[${t}] ${message}\n`; logEl.scrollTop=logEl.scrollHeight;}
+function setStatus(kind,text){statusEl.className=`status ${kind}`; statusEl.textContent=text;}
+function formatBytes(bytes){if(!Number.isFinite(bytes)) return '-'; const units=['B','KiB','MiB','GiB','TiB']; let v=bytes,u=0; while(v>=1024&&u<units.length-1){v/=1024;u++;} return `${v.toFixed(v>=100?0:v>=10?1:2)} ${units[u]}`;}
+function formatNumber(value,digits=2){if(!Number.isFinite(value)) return '-'; return new Intl.NumberFormat(undefined,{minimumFractionDigits:0,maximumFractionDigits:digits}).format(value);}
+function updateHeapMetric(){ if(performance.memory&&Number.isFinite(performance.memory.usedJSHeapSize)) $('heapValue').textContent=formatBytes(performance.memory.usedJSHeapSize); else $('heapValue').textContent='n/a'; }
+function updateIsolationStatus(){ if(window.crossOriginIsolated){ isolationStatusEl.className='status good'; isolationStatusEl.textContent='crossOriginIsolated = true. Shared WebAssembly.Memory is available.'; } else { isolationStatusEl.className='status bad'; isolationStatusEl.textContent=['crossOriginIsolated = false. This page requires SharedArrayBuffer + shared WebAssembly.Memory.','Serve with:','Cross-Origin-Opener-Policy: same-origin','Cross-Origin-Embedder-Policy: require-corp'].join('\n'); } }
+class TypedBankRouter{ constructor(memories){this.memories=memories; this.cursorShard=0; this.cursorOffset=0; this.entries=[]; this.totalRows=0; this.totalBytes=0;} align(a){const r=this.cursorOffset%a; if(r!==0) this.cursorOffset += a-r;} allocateContiguous(byteLength,alignment){while(true){ if(this.cursorShard>=this.memories.length) throw new Error('Bank exhausted all shards.'); this.align(alignment); const buffer=this.memories[this.cursorShard].buffer; const shardSpace=buffer.byteLength-this.cursorOffset; if(byteLength<=shardSpace){const p={shardId:this.cursorShard,byteOffset:this.cursorOffset,byteLength}; this.cursorOffset += byteLength; this.totalBytes += byteLength; return p;} this.cursorShard++; this.cursorOffset=0; }} writeTypedArray(typedArray,alignment){const p=this.allocateContiguous(typedArray.byteLength,alignment); new Uint8Array(this.memories[p.shardId].buffer,p.byteOffset,p.byteLength).set(new Uint8Array(typedArray.buffer,typedArray.byteOffset,typedArray.byteLength)); return p;} writeBatch(partition,featureA,label){ const e={id:this.entries.length,rowOffset:this.totalRows,rowCount:featureA.length,partition:this.writeTypedArray(partition,4),featureA:this.writeTypedArray(featureA,8),label:this.writeTypedArray(label,4)}; this.entries.push(e); this.totalRows += e.rowCount; return e; }}
+function buildAssignments(entries,workerCount){const buckets=Array.from({length:workerCount},(_,workerId)=>({workerId,entries:[]})); entries.forEach((entry,index)=>buckets[index%workerCount].entries.push(entry)); return buckets.filter(b=>b.entries.length>0);}
+async function initParquetWasm(){ if(parquetWasm) { parquetStatusEl.className='status good'; parquetStatusEl.textContent='Parquet-Wasm already initialized.'; return; } parquetStatusEl.className='status warn'; parquetStatusEl.textContent='Loading parquet-wasm + Arrow...'; log('Importing parquet-wasm and Apache Arrow from CDN...'); parquetWasm=await import(PARQUET_WASM_URL); await parquetWasm.default(); arrow=await import(ARROW_CDN); parquetStatusEl.className='status good'; parquetStatusEl.textContent='Parquet-Wasm initialized and ready.'; log('Parquet-Wasm initialized successfully.'); }
+async function pickParquetFile(){ if(!parquetWasm) await initParquetWasm(); fileInput.value=''; fileInput.click(); await new Promise((resolve,reject)=>{ fileInput.onchange=()=>fileInput.files?.[0]?resolve():reject(new Error('No file selected')); }); selectedFile=fileInput.files[0]; if(!selectedFile) throw new Error('No file selected.'); fileStatusEl.className='status good'; fileStatusEl.textContent=`Selected file: ${selectedFile.name} (${formatBytes(selectedFile.size)}).`; }
+async function allocateBank(){ if(!window.crossOriginIsolated) throw new Error('Shared WebAssembly.Memory unavailable.'); const shardMiB=Number($('shardMiBInput').value); const targetGiB=Number($('targetGiBInput').value); if(!Number.isFinite(shardMiB)||shardMiB<=0) throw new Error('Invalid shard size.'); if(!Number.isFinite(targetGiB)||targetGiB<=0) throw new Error('Invalid target bank size.'); const shardBytes=shardMiB*1024*1024; const targetBytes=targetGiB*1024*1024*1024; if(shardBytes%65536!==0) throw new Error('Shard size must align to 64 KiB wasm pages.'); const pages=shardBytes/65536; memories=[]; bank=null; while(memories.reduce((s,m)=>s+m.buffer.byteLength,0)<targetBytes){ const memory=new WebAssembly.Memory({shared:true,initial:pages,maximum:pages}); const touch=new Uint8Array(memory.buffer); for(let i=0;i<touch.length;i+=4096) touch[i]=(touch[i]+1)&0xff; if(touch.length) touch[touch.length-1]=(touch[touch.length-1]+1)&0xff; memories.push(memory); } $('shardCountValue').textContent=formatNumber(memories.length,0); $('bankSizeValue').textContent=formatBytes(memories.reduce((s,m)=>s+m.buffer.byteLength,0)); updateHeapMetric(); log(`Allocated ${formatBytes(memories.reduce((s,m)=>s+m.buffer.byteLength,0))} shared bank across ${memories.length} shard(s).`); }
+function normalizeFloat64(vector){ const values=typeof vector.toArray==='function'?vector.toArray():null; if(values instanceof Float64Array) return values; if(ArrayBuffer.isView(values)) return Float64Array.from(values,Number); const out=new Float64Array(vector.length??values?.length??0); for(let i=0;i<out.length;i++) out[i]=Number(vector.get(i)); return out; }
+function normalizeInt32(vector){ const values=typeof vector.toArray==='function'?vector.toArray():null; if(values instanceof Int32Array) return values; if(ArrayBuffer.isView(values)) return Int32Array.from(values,Number); const out=new Int32Array(vector.length??values?.length??0); for(let i=0;i<out.length;i++) out[i]=Number(vector.get(i)); return out; }
+async function routeTypedColumns(){ if(!parquetWasm) throw new Error('Parquet-Wasm not initialized.'); if(!selectedFile) throw new Error('No Parquet file selected.'); if(!memories.length) throw new Error('Shared bank not allocated.'); const batchSize=Math.trunc(Number($('batchSizeInput').value)); if(!Number.isFinite(batchSize)||batchSize<=0) throw new Error('Invalid batch size.'); bank={router:new TypedBankRouter(memories), routeMs:0}; const startedAt=performance.now(); const file=await parquetWasm.ParquetFile.fromFile(selectedFile); const stream=await file.stream({ columns:['partition','feature_a','label'], batchSize }); const reader=stream.getReader(); let batchIndex=0; while(true){ const {value,done}=await reader.read(); if(done) break; const ipc=value.intoIPCStream(); const table=arrow.tableFromIPC(ipc); const batches=table.batches ?? []; for(const batch of batches){ const partition=normalizeInt32(batch.getChildAt(0)); const featureA=normalizeFloat64(batch.getChildAt(1)); const label=normalizeInt32(batch.getChildAt(2)); bank.router.writeBatch(partition,featureA,label); batchIndex++; if(batchIndex===1||batchIndex%1000===0){ log(`Routed batch ${batchIndex}: rows=${formatNumber(bank.router.totalRows,0)}, used=${formatBytes(bank.router.totalBytes)}.`); await new Promise(r=>setTimeout(r,0)); } } }
+      file.free?.(); bank.routeMs=performance.now()-startedAt; $('usedBytesValue').textContent=formatBytes(bank.router.totalBytes); $('batchCountValue').textContent=formatNumber(bank.router.entries.length,0); $('rowCountValue').textContent=formatNumber(bank.router.totalRows,0); $('routeTimeValue').textContent=`${bank.routeMs.toFixed(1)} ms`; manifestEl.textContent=JSON.stringify({batchCount:bank.router.entries.length,totalRows:bank.router.totalRows,usedBytes:bank.router.totalBytes,entriesPreview:bank.router.entries.slice(0,8)},null,2); log(`Routing complete: ${formatNumber(bank.router.entries.length,0)} batch(es), ${formatNumber(bank.router.totalRows,0)} rows, ${formatBytes(bank.router.totalBytes)} typed bytes in ${bank.routeMs.toFixed(1)} ms.`); }
+function createWorkerUrl(){ const source=`
+      let polarsCache=null; async function getPolars(){ if(polarsCache) return polarsCache; const startedAt=performance.now(); const mod=await import('${POLARS_MODULE_URL}'); const response=await fetch('${POLARS_WASM_URL}'); const bytes=await response.arrayBuffer(); const polars=await mod.default(bytes); const endedAt=performance.now(); polarsCache={polars,wasmSize:bytes.byteLength,loadMs:endedAt-startedAt}; return polarsCache; }
+      function aggregateLive(memories,entries){ let sum=0,label1Count=0,partition0Count=0,partition1Count=0; for(const entry of entries){ const partition=new Int32Array(memories[entry.partition.shardId].buffer,entry.partition.byteOffset,entry.rowCount); const featureA=new Float64Array(memories[entry.featureA.shardId].buffer,entry.featureA.byteOffset,entry.rowCount); const label=new Int32Array(memories[entry.label.shardId].buffer,entry.label.byteOffset,entry.rowCount); for(let i=0;i<entry.rowCount;i++){ if(partition[i]===0) partition0Count++; else if(partition[i]===1) partition1Count++; if(label[i]===1){ label1Count++; sum += featureA[i]; } } } return {sum,label1Count,partition0Count,partition1Count}; }
+      async function aggregatePolars(memories,entries){ const {polars,wasmSize,loadMs}=await getPolars(); const totalRows=entries.reduce((a,e)=>a+e.rowCount,0); const fillStartedAt=performance.now(); const featurePtr=polars.polars_alloc_f64_buffer(totalRows); const labelPtr=polars.polars_alloc_i32_buffer(totalRows); const partitionPtr=polars.polars_alloc_i32_buffer(totalRows); if(!featurePtr||!labelPtr||!partitionPtr) throw new Error('Polars allocation failed.'); const featureOut=new Float64Array(polars.memory.buffer,featurePtr,totalRows); const labelOut=new Int32Array(polars.memory.buffer,labelPtr,totalRows); const partitionOut=new Int32Array(polars.memory.buffer,partitionPtr,totalRows); let cursor=0; for(const entry of entries){ const partition=new Int32Array(memories[entry.partition.shardId].buffer,entry.partition.byteOffset,entry.rowCount); const featureA=new Float64Array(memories[entry.featureA.shardId].buffer,entry.featureA.byteOffset,entry.rowCount); const label=new Int32Array(memories[entry.label.shardId].buffer,entry.label.byteOffset,entry.rowCount); featureOut.set(featureA,cursor); labelOut.set(label,cursor); partitionOut.set(partition,cursor); cursor += entry.rowCount; } const fillEndedAt=performance.now(); const polarsStartedAt=performance.now(); const sum=polars.polars_from_owned_buffers(featurePtr,labelPtr,partitionPtr,totalRows); const polarsEndedAt=performance.now(); return {wasmSize,loadMs,fillMs:fillEndedAt-fillStartedAt,polarsMs:polarsEndedAt-polarsStartedAt,sum,label1Count:polars.polars_last_label1_count(),partition0Count:polars.polars_last_partition0_count(),partition1Count:polars.polars_last_partition1_count()}; }
+      self.onmessage=async(event)=>{ const {workerId,mode,memories,entries}=event.data; try{ if(mode==='live'){ const startedAt=performance.now(); const out=aggregateLive(memories,entries); const endedAt=performance.now(); self.postMessage({ok:true,workerId,mode,rows:entries.reduce((a,e)=>a+e.rowCount,0),durationMs:endedAt-startedAt,...out}); return; } if(mode==='polars'){ const startedAt=performance.now(); const out=await aggregatePolars(memories,entries); const endedAt=performance.now(); self.postMessage({ok:true,workerId,mode,rows:entries.reduce((a,e)=>a+e.rowCount,0),wallMs:endedAt-startedAt,...out}); return; } throw new Error('Unknown mode: '+mode);} catch(error){ self.postMessage({ok:false,workerId,mode,error:error.message||String(error)}); } };
+    `; return URL.createObjectURL(new Blob([source],{type:'text/javascript'})); }
+async function runWorkerPhase(assignments,mode){ const workerUrl=createWorkerUrl(); const startedAt=performance.now(); const results=await Promise.all(assignments.map((assignment)=>new Promise((resolve,reject)=>{ const worker=new Worker(workerUrl,{type:'module'}); worker.onmessage=(event)=>{const data=event.data; worker.terminate(); if(!data.ok){reject(new Error(`Worker ${assignment.workerId} ${mode} failed: ${data.error}`));return;} resolve(data);}; worker.onerror=(error)=>{worker.terminate(); reject(error);}; worker.postMessage({workerId:assignment.workerId,mode,memories,entries:assignment.entries}); }))); URL.revokeObjectURL(workerUrl); const endedAt=performance.now(); const merged=results.reduce((acc,result)=>{ acc.sum += result.sum; acc.label1Count += result.label1Count; acc.partition0Count += result.partition0Count; acc.partition1Count += result.partition1Count; acc.maxLoadMs=Math.max(acc.maxLoadMs,result.loadMs||0); acc.maxFillMs=Math.max(acc.maxFillMs,result.fillMs||0); acc.maxPolarsMs=Math.max(acc.maxPolarsMs,result.polarsMs||0); return acc; },{sum:0,label1Count:0,partition0Count:0,partition1Count:0,maxLoadMs:0,maxFillMs:0,maxPolarsMs:0}); return {results,merged,wallMs:endedAt-startedAt}; }
+function mutateFirstLabel1(delta){ for(const entry of bank.router.entries){ const label=new Int32Array(memories[entry.label.shardId].buffer,entry.label.byteOffset,entry.rowCount); const featureA=new Float64Array(memories[entry.featureA.shardId].buffer,entry.featureA.byteOffset,entry.rowCount); for(let i=0;i<entry.rowCount;i++){ if(label[i]===1){ const before=featureA[i]; featureA[i]=before+delta; return {entryId:entry.id,localIndex:i,globalRow:entry.rowOffset+i,before,after:featureA[i],expectedDelta:delta}; } } } throw new Error('No label=1 row found to mutate.'); }
+function metricsEqual(a,b){ return Math.abs(a.sum-b.sum)<=1e-6*Math.max(1,Math.abs(b.sum)) && a.label1Count===b.label1Count && a.partition0Count===b.partition0Count && a.partition1Count===b.partition1Count; }
+async function runProof(){ if(!bank||!bank.router.entries.length) throw new Error('No routed bank data available.'); const workerCount=Math.trunc(Number($('workerCountInput').value)); const delta=Number($('deltaInput').value); const assignments=buildAssignments(bank.router.entries,workerCount); setStatus('warn','Running live + Polars workers over the routed bank...'); const liveInitial=await runWorkerPhase(assignments,'live'); const polarsInitial=await runWorkerPhase(assignments,'polars'); $('liveWallValue').textContent=`${liveInitial.wallMs.toFixed(1)} ms`; $('polarsWallValue').textContent=`${polarsInitial.wallMs.toFixed(1)} ms`; $('polarsInitValue').textContent=`${polarsInitial.merged.maxLoadMs.toFixed(1)} ms`; $('polarsFillValue').textContent=`${polarsInitial.merged.maxFillMs.toFixed(1)} ms`; $('polarsComputeValue').textContent=`${polarsInitial.merged.maxPolarsMs.toFixed(1)} ms`; $('liveSumValue').textContent=formatNumber(liveInitial.merged.sum,4); $('polarsSumValue').textContent=formatNumber(polarsInitial.merged.sum,4); const mutation=mutateFirstLabel1(delta); $('expectedDeltaValue').textContent=formatNumber(delta,4); log(`Mutated routed bank value at global row ${formatNumber(mutation.globalRow,0)}: ${mutation.before} -> ${mutation.after}.`); const liveMutated=await runWorkerPhase(assignments,'live'); const polarsMutated=await runWorkerPhase(assignments,'polars'); const liveDelta=liveMutated.merged.sum-liveInitial.merged.sum; const polarsDelta=polarsMutated.merged.sum-polarsInitial.merged.sum; $('liveDeltaValue').textContent=formatNumber(liveDelta,4); $('polarsDeltaValue').textContent=formatNumber(polarsDelta,4); const success=metricsEqual(liveInitial.merged,polarsInitial.merged)&&Math.abs(liveDelta-delta)<=1e-9*Math.max(1,Math.abs(delta))&&Math.abs(polarsDelta-delta)<=1e-9*Math.max(1,Math.abs(delta)); resultEl.textContent=JSON.stringify({workerCount:assignments.length,routedRows:bank.router.totalRows,routedBatches:bank.router.entries.length,routeMs:bank.routeMs,initialLive:{wallMs:liveInitial.wallMs,merged:liveInitial.merged,workers:liveInitial.results},initialPolars:{wallMs:polarsInitial.wallMs,merged:polarsInitial.merged,workers:polarsInitial.results},mutation,mutatedLive:{wallMs:liveMutated.wallMs,merged:liveMutated.merged,delta:liveDelta},mutatedPolars:{wallMs:polarsMutated.wallMs,merged:polarsMutated.merged,delta:polarsDelta},success},null,2); if(success) setStatus('good',`Parquet-Wasm -> bank -> live + Polars proof passed for ${formatNumber(bank.router.totalRows,0)} routed rows.`); else setStatus('bad','Parquet-Wasm -> bank -> live + Polars proof mismatch.'); log(`Live wall=${liveInitial.wallMs.toFixed(1)} ms, Polars wall=${polarsInitial.wallMs.toFixed(1)} ms, live delta=${liveDelta}, Polars delta=${polarsDelta}, success=${success}`); }
+function releaseAll(){ memories=[]; bank=null; manifestEl.textContent='No bank manifest yet.'; resultEl.textContent='No result yet.'; updateHeapMetric(); setStatus('warn','Released bank references.'); }
+$('initBtn').addEventListener('click',()=>{initParquetWasm().catch(error=>{parquetStatusEl.className='status bad'; parquetStatusEl.textContent=`Parquet-Wasm init failed: ${error.message}`; log(`Parquet-Wasm init failed: ${error.message}`);});});
+$('pickFileBtn').addEventListener('click',()=>{pickParquetFile().catch(error=>{fileStatusEl.className='status bad'; fileStatusEl.textContent=`File selection failed: ${error.message}`; log(`File selection failed: ${error.message}`);});});
+$('allocateBtn').addEventListener('click',()=>{allocateBank().catch(error=>{setStatus('bad',`Bank allocation failed: ${error.message}`); log(`Bank allocation failed: ${error.message}`);});});
+$('routeBtn').addEventListener('click',()=>{routeTypedColumns().catch(error=>{setStatus('bad',`Routing failed: ${error.message}`); log(`Routing failed: ${error.message}`);});});
+$('runBtn').addEventListener('click',()=>{runProof().catch(error=>{setStatus('bad',`Proof failed: ${error.message}`); log(`Proof failed: ${error.message}`);});});
+$('releaseBtn').addEventListener('click',()=>releaseAll());
+updateIsolationStatus(); updateHeapMetric(); manifestEl.textContent='No bank manifest yet.'; resultEl.textContent='No result yet.'; log('Ready. Init parquet-wasm, pick a Parquet file, allocate the shared bank, route typed columns, then run the real non-DuckDB live + Polars proof.');
+</script>
+</body>
+</html>

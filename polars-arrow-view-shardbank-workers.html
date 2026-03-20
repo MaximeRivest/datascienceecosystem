@@ -1,0 +1,703 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Arrow-View Shard Bank Workers (Polars Precursor)</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #121a33;
+      --panel-2: #0f1730;
+      --text: #e7ecff;
+      --muted: #a6b0d5;
+      --good: #66e3a4;
+      --warn: #ffd166;
+      --bad: #ff7b7b;
+      --border: #26345f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #0a0f1d, #0b1020 40%, #0d1327);
+      color: var(--text);
+    }
+    .wrap { max-width: 1220px; margin: 0 auto; padding: 32px 20px 48px; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { margin: 8px 0; color: var(--muted); }
+    .card {
+      background: rgba(18, 26, 51, 0.9);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      margin-top: 18px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.22);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    input, button {
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+    }
+    button {
+      border: 0;
+      background: linear-gradient(180deg, #1c6fff, #1758cc);
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .danger { background: linear-gradient(180deg, #c14444, #9e2f2f); }
+    .status {
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #101833;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
+    .status.good { border-color: rgba(102, 227, 164, .35); color: var(--good); }
+    .status.warn { border-color: rgba(255, 209, 102, .35); color: var(--warn); }
+    .status.bad { border-color: rgba(255, 123, 123, .35); color: var(--bad); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .metric {
+      background: #0e1630;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .metric .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .metric .value { margin-top: 8px; font-size: 22px; font-weight: 800; }
+    pre {
+      margin: 0;
+      background: #0b1228;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+      max-height: 360px;
+      color: #cfe0ff;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .small { font-size: 12px; color: var(--muted); }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Arrow-View Shard Bank Workers <span class="small">(Polars precursor)</span></h1>
+    <p>
+      This page is the next experiment inspired by the Arrow-view shim idea. It builds a partitioned shared <code>WebAssembly.Memory</code>
+      shard bank, exposes it through an Arrow-style manifest of live buffers, runs distributed worker aggregates directly over those live views,
+      and then performs a <strong>mutation proof</strong> in a fresh worker set.
+    </p>
+    <p class="small">
+      Important: this is a <strong>precursor</strong> to direct Polars live-view integration, not that final step yet. The point here is to prove the live shared-bank view,
+      partition model, and mutation semantics without going through Arrow IPC or another serializer.
+    </p>
+
+    <div id="status" class="status warn">Ready. Build the shared bank, run the distributed live-view aggregate, then verify the mutation delta.</div>
+
+    <div class="card">
+      <strong>Live-view setup</strong>
+      <div class="grid">
+        <label>
+          Total rows
+          <input id="rowsInput" type="number" min="1" step="1000000" value="38500000" />
+        </label>
+        <label>
+          Partition rows
+          <input id="partitionRowsInput" type="number" min="1" step="100000" value="2048000" />
+        </label>
+        <label>
+          Worker count
+          <input id="workerCountInput" type="number" min="1" max="16" step="1" value="4" />
+        </label>
+        <label>
+          Shard size (MiB)
+          <input id="shardMiBInput" type="number" min="16" step="16" value="64" />
+        </label>
+        <label>
+          Mutation delta
+          <input id="deltaInput" type="number" step="1" value="1000" />
+        </label>
+      </div>
+      <div class="row">
+        <button id="runBtn">Run live-view + mutation proof</button>
+        <button id="releaseBtn" class="danger">Release bank</button>
+      </div>
+      <p class="small">
+        Each partition stores its column buffers fully inside single shards. The manifest is Arrow-like: each column chunk points at values in a specific shard + offset + length.
+      </p>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="label">Shards</div><div id="shardCountValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Bank size</div><div id="bankSizeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Used bytes</div><div id="usedBytesValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Partitions</div><div id="partitionCountValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Build/fill time</div><div id="buildTimeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Initial wall</div><div id="initialWallValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Mutation wall</div><div id="mutationWallValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Initial sum</div><div id="initialSumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Mutated sum</div><div id="mutatedSumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Expected delta</div><div id="expectedDeltaValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Observed delta</div><div id="observedDeltaValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Label1 count</div><div id="countValue" class="value">-</div></div>
+      <div class="metric"><div class="label">JS sum</div><div id="jsSumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Chrome heap used*</div><div id="heapValue" class="value">-</div></div>
+    </div>
+
+    <div class="card">
+      <strong>Arrow-style manifest</strong>
+      <pre id="manifest"></pre>
+    </div>
+
+    <div class="card">
+      <strong>Result</strong>
+      <pre id="result"></pre>
+    </div>
+
+    <div class="card">
+      <strong>Log</strong>
+      <pre id="log"></pre>
+      <p class="small">
+        * Use Chrome Task Manager to confirm memory scaling. View build should be metadata work; fresh-worker mutation results should reflect live shared-bank buffers.
+      </p>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const statusEl = $('status');
+    const manifestEl = $('manifest');
+    const resultEl = $('result');
+    const logEl = $('log');
+    const runBtn = $('runBtn');
+    const releaseBtn = $('releaseBtn');
+    const rowsInput = $('rowsInput');
+    const partitionRowsInput = $('partitionRowsInput');
+    const workerCountInput = $('workerCountInput');
+    const shardMiBInput = $('shardMiBInput');
+    const deltaInput = $('deltaInput');
+
+    const CYCLE = 3000;
+    const cyclePrefix = buildCyclePrefix();
+    let memories = [];
+    let manifest = null;
+    let usedBytes = 0;
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      logEl.textContent += `[${time}] ${message}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setStatus(kind, text) {
+      statusEl.className = `status ${kind}`;
+      statusEl.textContent = text;
+    }
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes)) return '-';
+      const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+      let value = bytes;
+      let index = 0;
+      while (value >= 1024 && index < units.length - 1) {
+        value /= 1024;
+        index++;
+      }
+      return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[index]}`;
+    }
+
+    function formatNumber(value, digits = 2) {
+      if (!Number.isFinite(value)) return '-';
+      return new Intl.NumberFormat(undefined, {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: digits,
+      }).format(value);
+    }
+
+    function updateHeapMetric() {
+      if (performance.memory && Number.isFinite(performance.memory.usedJSHeapSize)) {
+        $('heapValue').textContent = formatBytes(performance.memory.usedJSHeapSize);
+      } else {
+        $('heapValue').textContent = 'n/a';
+      }
+    }
+
+    function buildCyclePrefix() {
+      const prefix = [{ sum: 0, label1Count: 0, partition0Count: 0, partition1Count: 0 }];
+      let sum = 0;
+      let label1Count = 0;
+      let partition0Count = 0;
+      let partition1Count = 0;
+      for (let i = 0; i < CYCLE; i++) {
+        const value = ((i % 1000) * 0.5) - 100.0;
+        const label = (i % 3 === 0 || i % 5 === 0) ? 1 : 0;
+        const partition = i % 8;
+        if (partition === 0) partition0Count++;
+        else if (partition === 1) partition1Count++;
+        if (label === 1) {
+          sum += value;
+          label1Count++;
+        }
+        prefix.push({ sum, label1Count, partition0Count, partition1Count });
+      }
+      return prefix;
+    }
+
+    function statsUpTo(rows) {
+      const fullCycles = Math.floor(rows / CYCLE);
+      const remainder = rows % CYCLE;
+      const cycleStats = cyclePrefix[CYCLE];
+      const remainderStats = cyclePrefix[remainder];
+      return {
+        sum: fullCycles * cycleStats.sum + remainderStats.sum,
+        label1Count: fullCycles * cycleStats.label1Count + remainderStats.label1Count,
+        partition0Count: fullCycles * cycleStats.partition0Count + remainderStats.partition0Count,
+        partition1Count: fullCycles * cycleStats.partition1Count + remainderStats.partition1Count,
+      };
+    }
+
+    function statsForRange(startRow, endRow) {
+      const a = statsUpTo(startRow);
+      const b = statsUpTo(endRow);
+      return {
+        sum: b.sum - a.sum,
+        label1Count: b.label1Count - a.label1Count,
+        partition0Count: b.partition0Count - a.partition0Count,
+        partition1Count: b.partition1Count - a.partition1Count,
+      };
+    }
+
+    function totalBankBytes() {
+      return memories.reduce((sum, memory) => sum + memory.buffer.byteLength, 0);
+    }
+
+    function releaseAll() {
+      memories = [];
+      manifest = null;
+      usedBytes = 0;
+      manifestEl.textContent = 'No manifest yet.';
+      resultEl.textContent = 'No result yet.';
+      $('shardCountValue').textContent = '-';
+      $('bankSizeValue').textContent = '-';
+      $('usedBytesValue').textContent = '-';
+      $('partitionCountValue').textContent = '-';
+      $('buildTimeValue').textContent = '-';
+      $('initialWallValue').textContent = '-';
+      $('mutationWallValue').textContent = '-';
+      $('initialSumValue').textContent = '-';
+      $('mutatedSumValue').textContent = '-';
+      $('expectedDeltaValue').textContent = '-';
+      $('observedDeltaValue').textContent = '-';
+      $('countValue').textContent = '-';
+      $('jsSumValue').textContent = '-';
+      updateHeapMetric();
+      setStatus('warn', 'Released shared bank references.');
+      log('Released shared Wasm-memory shard bank references.');
+    }
+
+    function buildAssignments(partitions, workerCount) {
+      const buckets = Array.from({ length: workerCount }, (_, workerId) => ({ workerId, partitions: [] }));
+      partitions.forEach((partition, index) => {
+        buckets[index % workerCount].partitions.push(partition);
+      });
+      return buckets.filter((bucket) => bucket.partitions.length > 0);
+    }
+
+    class SingleChunkRouter {
+      constructor(memories) {
+        this.memories = memories;
+        this.shardIndex = 0;
+        this.offset = 0;
+      }
+
+      align(alignment) {
+        const rem = this.offset % alignment;
+        if (rem !== 0) this.offset += alignment - rem;
+      }
+
+      reserve(byteLength, alignment) {
+        this.align(alignment);
+        while (this.shardIndex < this.memories.length) {
+          const buffer = this.memories[this.shardIndex].buffer;
+          const remaining = buffer.byteLength - this.offset;
+          if (remaining >= byteLength) {
+            const ref = {
+              shardId: this.shardIndex,
+              byteOffset: this.offset,
+              byteLength,
+            };
+            this.offset += byteLength;
+            usedBytes = Math.max(usedBytes, this.shardIndex * buffer.byteLength + this.offset);
+            return ref;
+          }
+          this.shardIndex++;
+          this.offset = 0;
+        }
+        throw new Error(`Out of shards while reserving ${formatBytes(byteLength)}.`);
+      }
+    }
+
+    function createBank(totalRows, partitionRows, shardMiB) {
+      const bytesPerRow = 8 + 4 + 4;
+      const overheadBytes = Math.ceil(totalRows / partitionRows) * 512;
+      const requiredBytes = totalRows * bytesPerRow + overheadBytes;
+      const shardBytes = shardMiB * 1024 * 1024;
+      if (shardBytes % 65536 !== 0) throw new Error('Shard size must align to 64 KiB wasm pages.');
+      const shardPages = shardBytes / 65536;
+      const shardCount = Math.max(1, Math.ceil(requiredBytes / shardBytes));
+      memories = [];
+      usedBytes = 0;
+      for (let i = 0; i < shardCount; i++) {
+        const memory = new WebAssembly.Memory({ shared: true, initial: shardPages, maximum: shardPages });
+        memories.push(memory);
+      }
+      return { requiredBytes, shardBytes, shardCount };
+    }
+
+    function fillBankAndManifest(totalRows, partitionRows) {
+      const router = new SingleChunkRouter(memories);
+      const partitions = [];
+      let startRow = 0;
+      while (startRow < totalRows) {
+        const rows = Math.min(partitionRows, totalRows - startRow);
+        const featureRef = router.reserve(rows * Float64Array.BYTES_PER_ELEMENT, Float64Array.BYTES_PER_ELEMENT);
+        const labelRef = router.reserve(rows * Int32Array.BYTES_PER_ELEMENT, Int32Array.BYTES_PER_ELEMENT);
+        const partitionRef = router.reserve(rows * Int32Array.BYTES_PER_ELEMENT, Int32Array.BYTES_PER_ELEMENT);
+
+        const featureView = new Float64Array(memories[featureRef.shardId].buffer, featureRef.byteOffset, rows);
+        const labelView = new Int32Array(memories[labelRef.shardId].buffer, labelRef.byteOffset, rows);
+        const partitionView = new Int32Array(memories[partitionRef.shardId].buffer, partitionRef.byteOffset, rows);
+
+        let minA = Infinity;
+        let maxA = -Infinity;
+        let labelNullCount = 0;
+        for (let i = 0; i < rows; i++) {
+          const globalIndex = startRow + i;
+          const featureA = ((globalIndex % 1000) * 0.5) - 100.0;
+          const label = (globalIndex % 3 === 0 || globalIndex % 5 === 0) ? 1 : 0;
+          const partition = globalIndex % 8;
+          featureView[i] = featureA;
+          labelView[i] = label;
+          partitionView[i] = partition;
+          if (featureA < minA) minA = featureA;
+          if (featureA > maxA) maxA = featureA;
+        }
+
+        partitions.push({
+          partitionId: partitions.length,
+          rowOffset: startRow,
+          rowCount: rows,
+          columns: {
+            feature_a: { rowOffset: startRow, rowCount: rows, values: featureRef, stats: { min: minA, max: maxA, nullCount: 0 } },
+            label: { rowOffset: startRow, rowCount: rows, values: labelRef, stats: { nullCount: labelNullCount } },
+            partition: { rowOffset: startRow, rowCount: rows, values: partitionRef, stats: { min: startRow % 8, max: 7, nullCount: 0 } },
+          },
+        });
+
+        startRow += rows;
+      }
+
+      manifest = {
+        schema: [
+          { name: 'feature_a', logicalType: 'f64' },
+          { name: 'label', logicalType: 'i32' },
+          { name: 'partition', logicalType: 'i32' },
+        ],
+        partitions,
+        totalRows,
+      };
+      return manifest;
+    }
+
+    function createWorkerUrl() {
+      const source = `
+        function aggregatePartition(memoryBank, partition) {
+          const featureCol = partition.columns.feature_a;
+          const labelCol = partition.columns.label;
+          const partitionCol = partition.columns.partition;
+          const feature = new Float64Array(memoryBank[featureCol.values.shardId].buffer, featureCol.values.byteOffset, partition.rowCount);
+          const label = new Int32Array(memoryBank[labelCol.values.shardId].buffer, labelCol.values.byteOffset, partition.rowCount);
+          const part = new Int32Array(memoryBank[partitionCol.values.shardId].buffer, partitionCol.values.byteOffset, partition.rowCount);
+          let sum = 0;
+          let label1Count = 0;
+          let partition0Count = 0;
+          let partition1Count = 0;
+          for (let i = 0; i < partition.rowCount; i++) {
+            if (part[i] === 0) partition0Count++;
+            else if (part[i] === 1) partition1Count++;
+            if (label[i] === 1) {
+              label1Count++;
+              sum += feature[i];
+            }
+          }
+          return { sum, label1Count, partition0Count, partition1Count };
+        }
+
+        self.onmessage = (event) => {
+          const { workerId, memories, partitions } = event.data;
+          const startedAt = performance.now();
+          let sum = 0;
+          let label1Count = 0;
+          let partition0Count = 0;
+          let partition1Count = 0;
+          for (const partition of partitions) {
+            const partial = aggregatePartition(memories, partition);
+            sum += partial.sum;
+            label1Count += partial.label1Count;
+            partition0Count += partial.partition0Count;
+            partition1Count += partial.partition1Count;
+          }
+          const endedAt = performance.now();
+          self.postMessage({
+            ok: true,
+            workerId,
+            partitions: partitions.length,
+            rows: partitions.reduce((acc, p) => acc + p.rowCount, 0),
+            sum,
+            label1Count,
+            partition0Count,
+            partition1Count,
+            durationMs: endedAt - startedAt,
+          });
+        };
+      `;
+      return URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    }
+
+    async function runDistributedAggregate(assignments) {
+      const workerUrl = createWorkerUrl();
+      const startedAt = performance.now();
+      const results = await Promise.all(assignments.map((assignment) => new Promise((resolve, reject) => {
+        const worker = new Worker(workerUrl);
+        worker.onmessage = (event) => {
+          const data = event.data;
+          worker.terminate();
+          if (!data.ok) {
+            reject(new Error(`Worker ${assignment.workerId} failed.`));
+            return;
+          }
+          resolve(data);
+        };
+        worker.onerror = (error) => {
+          worker.terminate();
+          reject(error);
+        };
+        worker.postMessage({
+          workerId: assignment.workerId,
+          memories,
+          partitions: assignment.partitions,
+        });
+      })));
+      URL.revokeObjectURL(workerUrl);
+      const endedAt = performance.now();
+      const merged = results.reduce((acc, result) => {
+        acc.sum += result.sum;
+        acc.label1Count += result.label1Count;
+        acc.partition0Count += result.partition0Count;
+        acc.partition1Count += result.partition1Count;
+        acc.maxWorkerMs = Math.max(acc.maxWorkerMs, result.durationMs);
+        return acc;
+      }, {
+        sum: 0,
+        label1Count: 0,
+        partition0Count: 0,
+        partition1Count: 0,
+        maxWorkerMs: 0,
+      });
+      return { results, merged, wallMs: endedAt - startedAt };
+    }
+
+    function mutateLabel1Value(delta) {
+      if (!manifest || !manifest.partitions.length) throw new Error('No manifest available.');
+      const targetPartition = manifest.partitions[0];
+      const featureCol = targetPartition.columns.feature_a;
+      const labelCol = targetPartition.columns.label;
+      const feature = new Float64Array(memories[featureCol.values.shardId].buffer, featureCol.values.byteOffset, targetPartition.rowCount);
+      const label = new Int32Array(memories[labelCol.values.shardId].buffer, labelCol.values.byteOffset, targetPartition.rowCount);
+      let localIndex = -1;
+      for (let i = 0; i < targetPartition.rowCount; i++) {
+        if (label[i] === 1) {
+          localIndex = i;
+          break;
+        }
+      }
+      if (localIndex === -1) throw new Error('No label=1 row found for mutation.');
+      const globalIndex = targetPartition.rowOffset + localIndex;
+      const before = feature[localIndex];
+      feature[localIndex] = before + delta;
+      return {
+        partitionId: targetPartition.partitionId,
+        localIndex,
+        globalIndex,
+        before,
+        after: feature[localIndex],
+        expectedDelta: delta,
+      };
+    }
+
+    async function runProof() {
+      const totalRows = Math.trunc(Number(rowsInput.value));
+      const partitionRows = Math.trunc(Number(partitionRowsInput.value));
+      const workerCount = Math.trunc(Number(workerCountInput.value));
+      const shardMiB = Math.trunc(Number(shardMiBInput.value));
+      const delta = Number(deltaInput.value);
+      if (!Number.isFinite(totalRows) || totalRows <= 0) return setStatus('bad', 'Invalid total rows.');
+      if (!Number.isFinite(partitionRows) || partitionRows <= 0) return setStatus('bad', 'Invalid partition rows.');
+      if (!Number.isFinite(workerCount) || workerCount <= 0) return setStatus('bad', 'Invalid worker count.');
+      if (!Number.isFinite(shardMiB) || shardMiB <= 0) return setStatus('bad', 'Invalid shard size.');
+      if (!Number.isFinite(delta) || delta === 0) return setStatus('bad', 'Invalid mutation delta.');
+
+      runBtn.disabled = true;
+      logEl.textContent = '';
+      resultEl.textContent = '';
+      setStatus('warn', 'Building shared bank and Arrow-style manifest...');
+
+      try {
+        const buildStartedAt = performance.now();
+        const bankInfo = createBank(totalRows, partitionRows, shardMiB);
+        fillBankAndManifest(totalRows, partitionRows);
+        const buildEndedAt = performance.now();
+
+        $('shardCountValue').textContent = formatNumber(memories.length, 0);
+        $('bankSizeValue').textContent = formatBytes(totalBankBytes());
+        $('usedBytesValue').textContent = formatBytes(usedBytes);
+        $('partitionCountValue').textContent = formatNumber(manifest.partitions.length, 0);
+        $('buildTimeValue').textContent = `${(buildEndedAt - buildStartedAt).toFixed(1)} ms`;
+
+        const assignments = buildAssignments(manifest.partitions, workerCount);
+        manifestEl.textContent = JSON.stringify({
+          totalRows,
+          workerCount: assignments.length,
+          shardMiB,
+          requiredBytes: bankInfo.requiredBytes,
+          shardCount: bankInfo.shardCount,
+          partitionCount: manifest.partitions.length,
+          assignments: assignments.map((assignment) => ({
+            workerId: assignment.workerId,
+            partitions: assignment.partitions.map((partition) => ({
+              partitionId: partition.partitionId,
+              rowOffset: partition.rowOffset,
+              rowCount: partition.rowCount,
+            })),
+          })),
+        }, null, 2);
+
+        const reference = statsForRange(0, totalRows);
+        $('jsSumValue').textContent = formatNumber(reference.sum, 4);
+
+        log(`Running initial distributed live-view aggregate over ${formatNumber(totalRows, 0)} rows, ${formatNumber(manifest.partitions.length, 0)} partition(s), ${assignments.length} worker(s).`);
+        const initial = await runDistributedAggregate(assignments);
+        $('initialWallValue').textContent = `${initial.wallMs.toFixed(1)} ms`;
+        $('initialSumValue').textContent = formatNumber(initial.merged.sum, 4);
+        $('countValue').textContent = formatNumber(initial.merged.label1Count, 0);
+
+        log('Applying live-buffer mutation inside the shared bank...');
+        const mutation = mutateLabel1Value(delta);
+        $('expectedDeltaValue').textContent = formatNumber(mutation.expectedDelta, 4);
+        log(`Mutated partition ${mutation.partitionId}, global row ${formatNumber(mutation.globalIndex, 0)}: ${mutation.before} -> ${mutation.after}.`);
+
+        log('Running fresh distributed aggregate after mutation...');
+        const mutated = await runDistributedAggregate(assignments);
+        $('mutationWallValue').textContent = `${mutated.wallMs.toFixed(1)} ms`;
+        $('mutatedSumValue').textContent = formatNumber(mutated.merged.sum, 4);
+
+        const observedDelta = mutated.merged.sum - initial.merged.sum;
+        $('observedDeltaValue').textContent = formatNumber(observedDelta, 4);
+
+        const initialSuccess =
+          Math.abs(initial.merged.sum - reference.sum) <= 1e-6 * Math.max(1, Math.abs(reference.sum)) &&
+          initial.merged.label1Count === reference.label1Count &&
+          initial.merged.partition0Count === reference.partition0Count &&
+          initial.merged.partition1Count === reference.partition1Count;
+
+        const mutatedSuccess =
+          Math.abs(observedDelta - mutation.expectedDelta) <= 1e-9 * Math.max(1, Math.abs(mutation.expectedDelta)) &&
+          mutated.merged.label1Count === initial.merged.label1Count &&
+          mutated.merged.partition0Count === initial.merged.partition0Count &&
+          mutated.merged.partition1Count === initial.merged.partition1Count;
+
+        const success = initialSuccess && mutatedSuccess;
+        resultEl.textContent = JSON.stringify({
+          totalRows,
+          partitionRows,
+          workerCount: assignments.length,
+          shardMiB,
+          shardCount: memories.length,
+          bankSizeBytes: totalBankBytes(),
+          usedBytes,
+          partitionCount: manifest.partitions.length,
+          initialRun: {
+            wallMs: initial.wallMs,
+            merged: initial.merged,
+            workers: initial.results,
+            success: initialSuccess,
+          },
+          mutation,
+          mutatedRun: {
+            wallMs: mutated.wallMs,
+            merged: mutated.merged,
+          },
+          expectedDelta: mutation.expectedDelta,
+          observedDelta,
+          jsReference: reference,
+          success,
+        }, null, 2);
+
+        if (success) {
+          setStatus('good', `Live-view mutation proof passed for ${formatNumber(totalRows, 0)} rows across ${assignments.length} workers.`);
+        } else {
+          setStatus('bad', 'Live-view mutation proof mismatch.');
+        }
+
+        log(`Initial wall=${initial.wallMs.toFixed(1)} ms, mutation wall=${mutated.wallMs.toFixed(1)} ms, expected delta=${mutation.expectedDelta}, observed delta=${observedDelta}, success=${success}`);
+      } catch (error) {
+        setStatus('bad', `Live-view mutation proof failed: ${error.message || error}`);
+        log(`FAIL: ${error.message || error}`);
+      } finally {
+        runBtn.disabled = false;
+        updateHeapMetric();
+      }
+    }
+
+    runBtn.addEventListener('click', () => {
+      runProof();
+    });
+
+    releaseBtn.addEventListener('click', () => {
+      releaseAll();
+    });
+
+    manifestEl.textContent = 'No manifest yet.';
+    resultEl.textContent = 'No result yet.';
+    updateHeapMetric();
+    log('Ready. This page proves live shared-bank manifest views and a fresh-worker mutation delta before direct Polars live-view integration.');
+  </script>
+</body>
+</html>

@@ -1,0 +1,755 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Monolithic Memory Proof</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #121a33;
+      --panel-2: #0f1730;
+      --text: #e7ecff;
+      --muted: #a6b0d5;
+      --good: #66e3a4;
+      --warn: #ffd166;
+      --bad: #ff7b7b;
+      --border: #26345f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #0a0f1d, #0b1020 40%, #0d1327);
+      color: var(--text);
+    }
+    .wrap {
+      max-width: 1220px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { margin: 8px 0; color: var(--muted); }
+    input, button, textarea {
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+    }
+    button {
+      border: 0;
+      background: linear-gradient(180deg, #1c6fff, #1758cc);
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .secondary { background: #1a2447; border: 1px solid var(--border); }
+    .danger { background: linear-gradient(180deg, #c14444, #9e2f2f); }
+    .card {
+      background: rgba(18, 26, 51, 0.9);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      margin-top: 18px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.22);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .status {
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #101833;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
+    .status.good { border-color: rgba(102, 227, 164, 0.35); color: var(--good); }
+    .status.warn { border-color: rgba(255, 209, 102, 0.35); color: var(--warn); }
+    .status.bad { border-color: rgba(255, 123, 123, 0.35); color: var(--bad); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .metric {
+      background: #0e1630;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .metric .label {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .metric .value {
+      margin-top: 8px;
+      font-size: 22px;
+      font-weight: 800;
+    }
+    pre {
+      margin: 0;
+      background: #0b1228;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+      max-height: 360px;
+      color: #cfe0ff;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .small { font-size: 12px; color: var(--muted); }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Monolithic Memory Proof</h1>
+    <p>
+      This page tests whether a <em>single</em> giant memory object is a viable substitute for the proven sharded bank.
+      It runs two separate probes: one for a monolithic <code>SharedArrayBuffer</code> and one for a monolithic shared
+      <code>WebAssembly.Memory</code>. The second probe is the one that matters most for Rust/Wasm analytics engines.
+    </p>
+
+    <div id="isolationStatus" class="status warn">Checking browser requirements...</div>
+    <div id="runtimeStatus" class="status warn">No test has run yet.</div>
+    <div id="interpretationStatus" class="status warn">Interpretation will appear after you run one or more monolithic tests.</div>
+
+    <div class="card">
+      <strong>Test setup</strong>
+      <div class="grid">
+        <label>
+          Size (MiB)
+          <input id="sizeMiB" type="number" min="16" step="16" value="1024" />
+        </label>
+        <label>
+          Worker count
+          <input id="workerCount" type="number" min="1" max="32" step="1" value="4" />
+        </label>
+        <label>
+          Touch/checksum stride (bytes)
+          <input id="strideBytes" type="number" min="256" step="256" value="4096" />
+        </label>
+        <label>
+          Hold after run (seconds)
+          <input id="holdSeconds" type="number" min="0" step="1" value="10" />
+        </label>
+        <label>
+          Architecture target (GiB)
+          <input id="targetGiB" type="number" min="1" step="1" value="10" />
+        </label>
+        <label>
+          Sweep sizes (MiB, comma-separated)
+          <input id="sweepMiBList" type="text" value="256,512,1024,2048,4096,6144,8192,10240,12288" />
+        </label>
+      </div>
+
+      <div class="row">
+        <button id="runSabBtn">Run monolithic SAB test</button>
+        <button id="runWasmBtn">Run monolithic shared Wasm test</button>
+        <button id="runSweepBtn" class="secondary">Run full sweep</button>
+        <button id="releaseBtn" class="danger">Release memory</button>
+      </div>
+
+      <p class="small">
+        Recommended flow: first run the monolithic SAB test, then the monolithic shared Wasm test at the same size.
+        If SAB works but shared Wasm fails at the target range, that is strong evidence that the compute substrate must be sharded.
+      </p>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="label">Last mode</div><div id="modeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Requested size</div><div id="requestedValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Wasm pages</div><div id="pageCountValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Touch/commit</div><div id="touchTimeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Checksum time</div><div id="checksumTimeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Reference checksum</div><div id="referenceValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Worker checksum</div><div id="actualValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Workers done</div><div id="workersDoneValue" class="value">0</div></div>
+      <div class="metric"><div class="label">Last result</div><div id="lastResultValue" class="value">ready</div></div>
+      <div class="metric"><div class="label">Chrome heap used*</div><div id="heapValue" class="value">-</div></div>
+    </div>
+
+    <div class="card">
+      <strong>Session summary</strong>
+      <pre id="summary"></pre>
+      <p class="small">
+        The most important summary line is the maximum successful size for <strong>shared WebAssembly.Memory</strong>.
+        If that ceiling stays well below your 10+ GiB target, then a monolithic Wasm substrate is not viable even if a giant SAB sometimes is.
+      </p>
+    </div>
+
+    <div class="card">
+      <strong>Log</strong>
+      <pre id="log"></pre>
+      <p class="small">
+        * <code>performance.memory</code> is JS heap only. Use Chrome Task Manager for real process memory.
+      </p>
+    </div>
+  </div>
+
+  <script>
+    const CHECKSUM_WASM_URL = './wasm/checksum_range.wasm';
+    const $ = (id) => document.getElementById(id);
+
+    const logEl = $('log');
+    const summaryEl = $('summary');
+    const isolationStatusEl = $('isolationStatus');
+    const runtimeStatusEl = $('runtimeStatus');
+    const interpretationStatusEl = $('interpretationStatus');
+
+    const runSabBtn = $('runSabBtn');
+    const runWasmBtn = $('runWasmBtn');
+    const runSweepBtn = $('runSweepBtn');
+    const releaseBtn = $('releaseBtn');
+
+    const sizeMiBInput = $('sizeMiB');
+    const workerCountInput = $('workerCount');
+    const strideBytesInput = $('strideBytes');
+    const holdSecondsInput = $('holdSeconds');
+    const targetGiBInput = $('targetGiB');
+    const sweepMiBListInput = $('sweepMiBList');
+
+    let currentSab = null;
+    let currentMemory = null;
+    let workers = [];
+    let compiledChecksumModule = null;
+    let memoryPoll = null;
+    let running = false;
+    let history = [];
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      logEl.textContent += `[${time}] ${message}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function formatBytes(bytes) {
+      if (typeof bytes === 'bigint') bytes = Number(bytes);
+      if (!Number.isFinite(bytes)) return '-';
+      const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+      let value = bytes;
+      let unitIndex = 0;
+      while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex++;
+      }
+      return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[unitIndex]}`;
+    }
+
+    function formatNumber(value) {
+      if (typeof value === 'bigint') return value.toString();
+      if (!Number.isFinite(value)) return '-';
+      return new Intl.NumberFormat().format(value);
+    }
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function updateHeapMetric() {
+      if (performance.memory && Number.isFinite(performance.memory.usedJSHeapSize)) {
+        $('heapValue').textContent = formatBytes(performance.memory.usedJSHeapSize);
+      } else {
+        $('heapValue').textContent = 'n/a';
+      }
+    }
+
+    function setButtonsDisabled(disabled) {
+      runSabBtn.disabled = disabled;
+      runWasmBtn.disabled = disabled;
+      runSweepBtn.disabled = disabled;
+    }
+
+    function cleanupWorkers() {
+      for (const worker of workers) worker.terminate();
+      workers = [];
+      $('workersDoneValue').textContent = '0';
+    }
+
+    async function releaseAll() {
+      cleanupWorkers();
+      currentSab = null;
+      currentMemory = null;
+      running = false;
+      setButtonsDisabled(false);
+      if (memoryPoll) {
+        clearInterval(memoryPoll);
+        memoryPoll = null;
+      }
+      $('modeValue').textContent = '-';
+      $('requestedValue').textContent = '-';
+      $('pageCountValue').textContent = '-';
+      $('touchTimeValue').textContent = '-';
+      $('checksumTimeValue').textContent = '-';
+      $('referenceValue').textContent = '-';
+      $('actualValue').textContent = '-';
+      $('lastResultValue').textContent = 'released';
+      updateHeapMetric();
+      runtimeStatusEl.className = 'status warn';
+      runtimeStatusEl.textContent = 'Released monolithic memory references.';
+      log('Released all monolithic memory references and worker handles.');
+    }
+
+    function updateIsolationStatus() {
+      if (!window.crossOriginIsolated) {
+        isolationStatusEl.className = 'status bad';
+        isolationStatusEl.textContent = [
+          'crossOriginIsolated = false. SharedArrayBuffer and shared WebAssembly.Memory will not work.',
+          'Serve with:',
+          'Cross-Origin-Opener-Policy: same-origin',
+          'Cross-Origin-Embedder-Policy: require-corp'
+        ].join('\n');
+        return;
+      }
+
+      if (!('SharedArrayBuffer' in window)) {
+        isolationStatusEl.className = 'status bad';
+        isolationStatusEl.textContent = 'SharedArrayBuffer is unavailable in this browser.';
+        return;
+      }
+
+      isolationStatusEl.className = 'status good';
+      isolationStatusEl.textContent = 'crossOriginIsolated = true. SharedArrayBuffer and shared WebAssembly.Memory should be available.';
+    }
+
+    function updateRuntimeStatus(message, kind = 'warn') {
+      runtimeStatusEl.className = `status ${kind}`;
+      runtimeStatusEl.textContent = message;
+    }
+
+    function parseInputs() {
+      const sizeMiB = Number(sizeMiBInput.value);
+      const workerCount = Number(workerCountInput.value);
+      const strideBytes = Number(strideBytesInput.value);
+      const holdSeconds = Number(holdSecondsInput.value);
+      const targetGiB = Number(targetGiBInput.value);
+
+      if (!Number.isFinite(sizeMiB) || sizeMiB <= 0) throw new Error('Invalid size (MiB).');
+      if (!Number.isFinite(workerCount) || workerCount <= 0) throw new Error('Invalid worker count.');
+      if (!Number.isFinite(strideBytes) || strideBytes <= 0) throw new Error('Invalid stride.');
+      if (!Number.isFinite(holdSeconds) || holdSeconds < 0) throw new Error('Invalid hold duration.');
+      if (!Number.isFinite(targetGiB) || targetGiB <= 0) throw new Error('Invalid architecture target.');
+
+      return {
+        sizeMiB: Math.trunc(sizeMiB),
+        workerCount: Math.trunc(workerCount),
+        strideBytes: Math.trunc(strideBytes),
+        holdSeconds: Math.trunc(holdSeconds),
+        targetGiB,
+      };
+    }
+
+    function parseSweepSizes() {
+      return sweepMiBListInput.value
+        .split(',')
+        .map((value) => Number(value.trim()))
+        .filter((value) => Number.isFinite(value) && value > 0)
+        .map((value) => Math.trunc(value));
+    }
+
+    function createPatternValue(offset, stride) {
+      return ((Math.floor(offset / Math.max(stride, 1)) * 17) + 29) & 0xff;
+    }
+
+    function touchAndChecksum(view, stride) {
+      let checksum = 0n;
+      const step = Math.max(1, stride);
+      for (let offset = 0; offset < view.length; offset += step) {
+        const value = createPatternValue(offset, step);
+        view[offset] = value;
+        checksum += BigInt(value);
+      }
+      return checksum;
+    }
+
+    async function loadChecksumModule() {
+      if (compiledChecksumModule) return compiledChecksumModule;
+      log(`Fetching Rust checksum module (${CHECKSUM_WASM_URL})...`);
+      compiledChecksumModule = await WebAssembly.compileStreaming(fetch(CHECKSUM_WASM_URL));
+      log('Rust checksum module compiled.');
+      return compiledChecksumModule;
+    }
+
+    function createWorkerBlobUrl() {
+      const source = `
+        let cachedModule = null;
+        let cachedMemory = null;
+        let cachedInstance = null;
+
+        async function getWasmInstance(module, memory) {
+          if (!cachedInstance || cachedModule !== module || cachedMemory !== memory) {
+            cachedModule = module;
+            cachedMemory = memory;
+            cachedInstance = await WebAssembly.instantiate(module, { env: { memory } });
+          }
+          return cachedInstance;
+        }
+
+        self.onmessage = async (event) => {
+          const { mode, workerId, startByte, byteLength, strideBytes, sab, memory, module } = event.data;
+          try {
+            const startedAt = performance.now();
+            let checksum = 0n;
+
+            if (mode === 'sab-js') {
+              const view = new Uint8Array(sab);
+              const endByte = startByte + byteLength;
+              for (let offset = startByte; offset < endByte; offset += strideBytes) {
+                checksum += BigInt(view[offset]);
+              }
+            } else if (mode === 'wasm-rust') {
+              const instance = await getWasmInstance(module, memory);
+              checksum = instance.exports.checksum_u8_range_stride(startByte, byteLength, strideBytes);
+            } else {
+              throw new Error('Unknown worker mode: ' + mode);
+            }
+
+            const endedAt = performance.now();
+            self.postMessage({
+              ok: true,
+              workerId,
+              checksum: checksum.toString(),
+              durationMs: endedAt - startedAt,
+              startByte,
+              byteLength,
+            });
+          } catch (error) {
+            self.postMessage({ ok: false, workerId, error: error.message || String(error) });
+          }
+        };
+      `;
+      return URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    }
+
+    async function runWorkerChecks({ mode, totalBytes, workerCount, strideBytes, sab = null, memory = null }) {
+      const workerUrl = createWorkerBlobUrl();
+      const module = mode === 'wasm-rust' ? await loadChecksumModule() : null;
+      const touchedPositions = Math.ceil(totalBytes / strideBytes);
+      const positionsPerWorker = Math.ceil(touchedPositions / workerCount);
+      let activeWorkers = 0;
+      let completedWorkers = 0;
+      let checksum = 0n;
+
+      const startedAt = performance.now();
+
+      try {
+        await new Promise((resolve, reject) => {
+          for (let workerId = 0; workerId < workerCount; workerId++) {
+            const startPos = workerId * positionsPerWorker;
+            const endPos = Math.min(startPos + positionsPerWorker, touchedPositions);
+            if (startPos >= endPos) continue;
+
+            const startByte = startPos * strideBytes;
+            const endByte = Math.min(endPos * strideBytes, totalBytes);
+            const byteLength = endByte - startByte;
+            if (byteLength <= 0) continue;
+
+            const worker = new Worker(workerUrl);
+            workers.push(worker);
+            activeWorkers++;
+
+            worker.onmessage = (event) => {
+              const data = event.data;
+              if (!data.ok) {
+                reject(new Error(`Worker ${data.workerId} failed: ${data.error}`));
+                return;
+              }
+              checksum += BigInt(data.checksum);
+              completedWorkers++;
+              $('workersDoneValue').textContent = formatNumber(completedWorkers);
+              log(`Worker ${data.workerId} done: start=${formatBytes(data.startByte)}, span=${formatBytes(data.byteLength)}, partial checksum=${data.checksum}, time=${data.durationMs.toFixed(1)} ms.`);
+              if (completedWorkers === activeWorkers) resolve();
+            };
+
+            worker.onerror = (error) => reject(error);
+            worker.postMessage({ mode, workerId, startByte, byteLength, strideBytes, sab, memory, module });
+          }
+
+          if (activeWorkers === 0) resolve();
+        });
+      } finally {
+        URL.revokeObjectURL(workerUrl);
+        cleanupWorkers();
+      }
+
+      const endedAt = performance.now();
+      return { checksum, elapsedMs: endedAt - startedAt, completedWorkers };
+    }
+
+    function pushHistory(entry) {
+      history.push(entry);
+      renderSummary();
+    }
+
+    function maxSuccessfulBytes(mode) {
+      return history
+        .filter((entry) => entry.mode === mode && entry.success)
+        .reduce((max, entry) => Math.max(max, entry.sizeBytes), 0);
+    }
+
+    function renderSummary() {
+      const targetBytes = Number(targetGiBInput.value) * 1024 * 1024 * 1024;
+      const summary = {
+        targetGiB: Number(targetGiBInput.value),
+        maxMonolithicSabSuccessBytes: maxSuccessfulBytes('sab'),
+        maxMonolithicSharedWasmSuccessBytes: maxSuccessfulBytes('wasm'),
+        runs: history.map((entry) => ({
+          mode: entry.mode,
+          sizeMiB: Math.round(entry.sizeBytes / (1024 * 1024)),
+          success: entry.success,
+          touchMs: Number(entry.touchMs.toFixed(1)),
+          checksumMs: Number(entry.checksumMs.toFixed(1)),
+          referenceChecksum: entry.referenceChecksum,
+          workerChecksum: entry.workerChecksum,
+          error: entry.error || null,
+        })),
+      };
+      summaryEl.textContent = JSON.stringify(summary, null, 2);
+
+      const sabMax = maxSuccessfulBytes('sab');
+      const wasmMax = maxSuccessfulBytes('wasm');
+      const wasmFailures = history.filter((entry) => entry.mode === 'wasm' && !entry.success);
+
+      if (history.length === 0) {
+        interpretationStatusEl.className = 'status warn';
+        interpretationStatusEl.textContent = 'Interpretation will appear after the first monolithic run.';
+        return;
+      }
+
+      const lines = [
+        `Max monolithic SAB success this session: ${sabMax ? formatBytes(sabMax) : 'none'}.`,
+        `Max monolithic shared Wasm success this session: ${wasmMax ? formatBytes(wasmMax) : 'none'}.`,
+      ];
+
+      if (wasmMax >= targetBytes) {
+        interpretationStatusEl.className = 'status good';
+        lines.push(`Shared Wasm succeeded at or above the ${formatNumber(Number(targetGiBInput.value))} GiB architecture target in this session.`);
+        lines.push('This page alone would not justify saying sharding is strictly required.');
+      } else if (sabMax >= targetBytes && (wasmFailures.length > 0 || wasmMax > 0)) {
+        interpretationStatusEl.className = 'status bad';
+        lines.push(`A giant SAB may be viable as storage at the ${formatNumber(Number(targetGiBInput.value))} GiB target, but a single shared Wasm memory is not.`);
+        lines.push('For Rust/Wasm compute, that means the practical substrate must be sharded.');
+      } else if (wasmMax > 0 && wasmMax < targetBytes) {
+        interpretationStatusEl.className = 'status bad';
+        lines.push(`Shared Wasm topped out below the ${formatNumber(Number(targetGiBInput.value))} GiB target in this session.`);
+        lines.push('That is strong evidence that a non-sharded Wasm compute substrate is not viable for the intended architecture.');
+      } else {
+        interpretationStatusEl.className = 'status warn';
+        lines.push('More data is needed. Try the shared Wasm test and/or the full sweep to establish a clear monolithic ceiling.');
+      }
+
+      interpretationStatusEl.textContent = lines.join('\n');
+    }
+
+    async function holdIfNeeded(seconds) {
+      if (seconds <= 0) return;
+      log(`Holding allocation for ${seconds} second(s) so you can inspect Chrome Task Manager...`);
+      await sleep(seconds * 1000);
+    }
+
+    async function runSingleTest(mode, sizeMiB, options = {}) {
+      if (!window.crossOriginIsolated) throw new Error('Shared memory requires cross-origin isolation.');
+      if (running) return;
+
+      const { workerCount, strideBytes, holdSeconds } = { ...parseInputs(), ...options };
+      const sizeBytes = sizeMiB * 1024 * 1024;
+
+      if (strideBytes <= 0) throw new Error('Stride must be positive.');
+      if (sizeBytes <= 0) throw new Error('Size must be positive.');
+      if (mode === 'wasm' && sizeBytes % 65536 !== 0) throw new Error('Shared Wasm memory size must align to 64 KiB pages.');
+
+      await releaseAll();
+      running = true;
+      setButtonsDisabled(true);
+      $('workersDoneValue').textContent = '0';
+      $('modeValue').textContent = mode === 'sab' ? 'Monolithic SAB' : 'Monolithic shared Wasm';
+      $('requestedValue').textContent = formatBytes(sizeBytes);
+      $('pageCountValue').textContent = mode === 'wasm' ? formatNumber(sizeBytes / 65536) : 'n/a';
+      $('touchTimeValue').textContent = '-';
+      $('checksumTimeValue').textContent = '-';
+      $('referenceValue').textContent = '-';
+      $('actualValue').textContent = '-';
+      $('lastResultValue').textContent = 'running';
+      updateRuntimeStatus(`Running ${mode === 'sab' ? 'monolithic SharedArrayBuffer' : 'monolithic shared WebAssembly.Memory'} test at ${formatBytes(sizeBytes)}...`, 'warn');
+
+      if (memoryPoll) clearInterval(memoryPoll);
+      memoryPoll = setInterval(updateHeapMetric, 1000);
+      updateHeapMetric();
+
+      log(`Starting ${mode === 'sab' ? 'monolithic SAB' : 'monolithic shared Wasm'} test at ${formatBytes(sizeBytes)} with ${workerCount} worker(s) and ${formatBytes(strideBytes)} stride.`);
+
+      let touchMs = 0;
+      let checksumMs = 0;
+      let referenceChecksum = 0n;
+      let workerChecksum = 0n;
+      let success = false;
+      let errorMessage = null;
+
+      try {
+        const setupStartedAt = performance.now();
+        let view;
+        if (mode === 'sab') {
+          currentSab = new SharedArrayBuffer(sizeBytes);
+          view = new Uint8Array(currentSab);
+          log(`Allocated monolithic SharedArrayBuffer: ${formatBytes(sizeBytes)}.`);
+        } else {
+          const pages = sizeBytes / 65536;
+          currentMemory = new WebAssembly.Memory({ shared: true, initial: pages, maximum: pages });
+          view = new Uint8Array(currentMemory.buffer);
+          log(`Allocated monolithic shared WebAssembly.Memory: ${formatBytes(sizeBytes)} (${formatNumber(pages)} pages).`);
+        }
+
+        const touchStartedAt = performance.now();
+        referenceChecksum = touchAndChecksum(view, strideBytes);
+        touchMs = performance.now() - touchStartedAt;
+        $('touchTimeValue').textContent = `${touchMs.toFixed(1)} ms`;
+        $('referenceValue').textContent = formatNumber(referenceChecksum);
+        log(`Touched memory one byte per ${formatBytes(strideBytes)} and computed reference checksum ${referenceChecksum.toString()}.`);
+
+        const workerResult = await runWorkerChecks({
+          mode: mode === 'sab' ? 'sab-js' : 'wasm-rust',
+          totalBytes: sizeBytes,
+          workerCount,
+          strideBytes,
+          sab: currentSab,
+          memory: currentMemory,
+        });
+        checksumMs = workerResult.elapsedMs;
+        workerChecksum = workerResult.checksum;
+        $('checksumTimeValue').textContent = `${checksumMs.toFixed(1)} ms`;
+        $('actualValue').textContent = formatNumber(workerChecksum);
+
+        success = workerChecksum === referenceChecksum;
+        $('lastResultValue').textContent = success ? 'success' : 'mismatch';
+        updateRuntimeStatus(
+          success
+            ? `${mode === 'sab' ? 'Monolithic SAB' : 'Monolithic shared Wasm'} test passed at ${formatBytes(sizeBytes)}.`
+            : `${mode === 'sab' ? 'Monolithic SAB' : 'Monolithic shared Wasm'} test mismatched at ${formatBytes(sizeBytes)}.`,
+          success ? 'good' : 'bad'
+        );
+
+        if (success) {
+          log(`SUCCESS: worker checksum matched the reference checksum (${workerChecksum.toString()}).`);
+        } else {
+          log(`FAIL: worker checksum ${workerChecksum.toString()} did not match reference ${referenceChecksum.toString()}.`);
+        }
+
+        const totalElapsedMs = performance.now() - setupStartedAt;
+        log(`Total elapsed for ${mode}: ${totalElapsedMs.toFixed(1)} ms.`);
+        await holdIfNeeded(holdSeconds);
+      } catch (error) {
+        errorMessage = error.message || String(error);
+        $('lastResultValue').textContent = 'failure';
+        updateRuntimeStatus(`${mode === 'sab' ? 'Monolithic SAB' : 'Monolithic shared Wasm'} test failed: ${errorMessage}`, 'bad');
+        log(`FAIL: ${errorMessage}`);
+      } finally {
+        pushHistory({
+          mode,
+          sizeBytes,
+          success,
+          touchMs,
+          checksumMs,
+          referenceChecksum: referenceChecksum != null ? referenceChecksum.toString() : null,
+          workerChecksum: workerChecksum != null ? workerChecksum.toString() : null,
+          error: errorMessage,
+        });
+        running = false;
+        setButtonsDisabled(false);
+        if (memoryPoll) {
+          clearInterval(memoryPoll);
+          memoryPoll = null;
+        }
+        updateHeapMetric();
+      }
+
+      return { success, error: errorMessage };
+    }
+
+    async function runFullSweep() {
+      const sizes = parseSweepSizes();
+      if (!sizes.length) throw new Error('Sweep sizes list is empty.');
+      const { holdSeconds } = parseInputs();
+
+      log('Starting full sweep.');
+      log(`Sweep sizes: ${sizes.join(', ')} MiB.`);
+      if (holdSeconds > 0) {
+        log('Note: holdSeconds applies to each individual run, so sweep may take a while. Set holdSeconds=0 for a faster sweep.');
+      }
+
+      for (const sizeMiB of sizes) {
+        const result = await runSingleTest('sab', sizeMiB);
+        if (!result.success) {
+          log(`Stopping SAB sweep after failure at ${sizeMiB} MiB.`);
+          break;
+        }
+      }
+
+      for (const sizeMiB of sizes) {
+        const result = await runSingleTest('wasm', sizeMiB);
+        if (!result.success) {
+          log(`Stopping shared Wasm sweep after failure at ${sizeMiB} MiB.`);
+          break;
+        }
+      }
+
+      log('Full sweep complete.');
+    }
+
+    runSabBtn.addEventListener('click', () => {
+      runSingleTest('sab', parseInputs().sizeMiB).catch((error) => {
+        updateRuntimeStatus(`Monolithic SAB test failed: ${error.message || error}`, 'bad');
+        log(`Unhandled SAB error: ${error.message || error}`);
+        running = false;
+        setButtonsDisabled(false);
+      });
+    });
+
+    runWasmBtn.addEventListener('click', () => {
+      runSingleTest('wasm', parseInputs().sizeMiB).catch((error) => {
+        updateRuntimeStatus(`Monolithic shared Wasm test failed: ${error.message || error}`, 'bad');
+        log(`Unhandled shared Wasm error: ${error.message || error}`);
+        running = false;
+        setButtonsDisabled(false);
+      });
+    });
+
+    runSweepBtn.addEventListener('click', () => {
+      runFullSweep().catch((error) => {
+        updateRuntimeStatus(`Full sweep failed: ${error.message || error}`, 'bad');
+        log(`Unhandled sweep error: ${error.message || error}`);
+        running = false;
+        setButtonsDisabled(false);
+      });
+    });
+
+    releaseBtn.addEventListener('click', () => {
+      releaseAll().catch((error) => log(`Release failed: ${error.message || error}`));
+    });
+
+    updateIsolationStatus();
+    renderSummary();
+    updateHeapMetric();
+    log('Ready. Run the monolithic SAB test first, then the monolithic shared Wasm test at the same size.');
+    log('If SAB works at large size but shared Wasm fails below the target, that supports the conclusion that the compute substrate must be sharded.');
+  </script>
+</body>
+</html>

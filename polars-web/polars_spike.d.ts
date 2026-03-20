@@ -7,13 +7,20 @@ export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly polars_smoke_test: () => number;
     readonly polars_generated_sum: (a: number) => number;
+    readonly polars_generated_sum_offset: (a: number, b: number) => number;
     readonly polars_generated_label1_count: (a: number) => number;
     readonly polars_last_partition0_count: () => number;
     readonly polars_last_partition1_count: () => number;
     readonly polars_from_buffers: (a: number, b: number, c: number, d: number) => number;
+    readonly polars_from_owned_buffers: (a: number, b: number, c: number, d: number) => number;
+    readonly polars_from_chunked_segment_buffers: (a: number, b: number, c: number, d: number, e: number) => number;
     readonly polars_last_label1_count: () => number;
     readonly polars_alloc_f64_buffer: (a: number) => number;
+    readonly polars_free_f64_buffer: (a: number, b: number) => void;
     readonly polars_alloc_i32_buffer: (a: number) => number;
+    readonly polars_free_i32_buffer: (a: number, b: number) => void;
+    readonly polars_alloc_u32_buffer: (a: number) => number;
+    readonly polars_free_u32_buffer: (a: number, b: number) => void;
     readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __wbindgen_start: () => void;
 }

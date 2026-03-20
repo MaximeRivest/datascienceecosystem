@@ -1,0 +1,726 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Polars Bank-Chunked Workers</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #121a33;
+      --panel-2: #0f1730;
+      --text: #e7ecff;
+      --muted: #a6b0d5;
+      --good: #66e3a4;
+      --warn: #ffd166;
+      --bad: #ff7b7b;
+      --border: #26345f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #0a0f1d, #0b1020 40%, #0d1327);
+      color: var(--text);
+    }
+    .wrap { max-width: 1220px; margin: 0 auto; padding: 32px 20px 48px; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { margin: 8px 0; color: var(--muted); }
+    .card {
+      background: rgba(18, 26, 51, 0.9);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      margin-top: 18px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.22);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    input, button {
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+    }
+    button {
+      border: 0;
+      background: linear-gradient(180deg, #1c6fff, #1758cc);
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .status {
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #101833;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
+    .status.good { border-color: rgba(102, 227, 164, .35); color: var(--good); }
+    .status.warn { border-color: rgba(255, 209, 102, .35); color: var(--warn); }
+    .status.bad { border-color: rgba(255, 123, 123, .35); color: var(--bad); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .metric {
+      background: #0e1630;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .metric .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .metric .value { margin-top: 8px; font-size: 22px; font-weight: 800; }
+    pre {
+      margin: 0;
+      background: #0b1228;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+      max-height: 360px;
+      color: #cfe0ff;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .small { font-size: 12px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Polars Bank-Chunked Workers</h1>
+    <p>
+      This page answers the missing question after the single-worker chunked-shim test: if we distribute the segmented bank-like layout across workers,
+      does the chunked shim catch up to the partition-arena path? It compares three distributed paths on equal worker count:
+      generated baseline, contiguous ownership-transfer arena, and earlier chunked-shim ingestion.
+    </p>
+
+    <div id="status" class="status warn">Ready. Run the distributed chunked-shim comparison.</div>
+
+    <div class="card">
+      <strong>Distributed chunked-shim setup</strong>
+      <div class="grid">
+        <label>
+          Total rows
+          <input id="rowsInput" type="number" min="1" step="1000000" value="100000000" />
+        </label>
+        <label>
+          Worker count
+          <input id="workerCountInput" type="number" min="1" max="16" step="1" value="4" />
+        </label>
+        <label>
+          Segment rows per worker
+          <input id="segmentRowsInput" type="number" min="1" step="100000" value="5000000" />
+        </label>
+      </div>
+      <div class="row">
+        <button id="runBtn">Run distributed proof</button>
+      </div>
+      <p class="small">
+        This is still synthetic typed-bank data, not real DuckDB-routed bank data yet. Its purpose is narrower: determine whether the earlier chunked shim still looks bad once the work is split across multiple workers.
+      </p>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="label">Wasm size</div><div id="wasmSizeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Worker init max</div><div id="workerInitValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Generated wall</div><div id="generatedWallValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Arena wall</div><div id="arenaWallValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Chunked wall</div><div id="chunkedWallValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Arena fill max</div><div id="arenaFillValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Arena Polars max</div><div id="arenaPolarsValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Chunked fill max</div><div id="chunkedFillValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Chunked Polars max</div><div id="chunkedPolarsValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Chunked segments / worker</div><div id="chunkedSegmentsValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Generated sum</div><div id="generatedSumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Arena sum</div><div id="arenaSumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Chunked sum</div><div id="chunkedSumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">JS sum</div><div id="jsSumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Chunked label1</div><div id="chunkedCountValue" class="value">-</div></div>
+      <div class="metric"><div class="label">JS label1</div><div id="jsCountValue" class="value">-</div></div>
+    </div>
+
+    <div class="card">
+      <strong>Worker partition plan</strong>
+      <pre id="manifest"></pre>
+    </div>
+
+    <div class="card">
+      <strong>Result</strong>
+      <pre id="result"></pre>
+    </div>
+
+    <div class="card">
+      <strong>Log</strong>
+      <pre id="log"></pre>
+    </div>
+  </div>
+
+  <script type="module">
+    const $ = (id) => document.getElementById(id);
+    const statusEl = $('status');
+    const manifestEl = $('manifest');
+    const resultEl = $('result');
+    const logEl = $('log');
+    const runBtn = $('runBtn');
+    const rowsInput = $('rowsInput');
+    const workerCountInput = $('workerCountInput');
+    const segmentRowsInput = $('segmentRowsInput');
+
+    const POLARS_MODULE_URL = new URL('./polars-web/polars_spike.js', import.meta.url).href;
+    const POLARS_WASM_URL = new URL('./polars-web/polars_spike_bg.wasm', import.meta.url).href;
+    const CYCLE = 3000;
+    const cyclePrefix = buildCyclePrefix();
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      logEl.textContent += `[${time}] ${message}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setStatus(kind, text) {
+      statusEl.className = `status ${kind}`;
+      statusEl.textContent = text;
+    }
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes)) return '-';
+      const units = ['B', 'KiB', 'MiB', 'GiB'];
+      let value = bytes;
+      let index = 0;
+      while (value >= 1024 && index < units.length - 1) {
+        value /= 1024;
+        index++;
+      }
+      return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[index]}`;
+    }
+
+    function formatNumber(value, digits = 2) {
+      if (!Number.isFinite(value)) return '-';
+      return new Intl.NumberFormat(undefined, {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: digits,
+      }).format(value);
+    }
+
+    function buildCyclePrefix() {
+      const prefix = [{ sum: 0, label1Count: 0, partition0Count: 0, partition1Count: 0 }];
+      let sum = 0;
+      let label1Count = 0;
+      let partition0Count = 0;
+      let partition1Count = 0;
+      for (let i = 0; i < CYCLE; i++) {
+        const value = ((i % 1000) * 0.5) - 100.0;
+        const label = (i % 3 === 0 || i % 5 === 0) ? 1 : 0;
+        const partition = i % 8;
+        if (partition === 0) partition0Count++;
+        else if (partition === 1) partition1Count++;
+        if (label === 1) {
+          sum += value;
+          label1Count++;
+        }
+        prefix.push({ sum, label1Count, partition0Count, partition1Count });
+      }
+      return prefix;
+    }
+
+    function statsUpTo(rows) {
+      const fullCycles = Math.floor(rows / CYCLE);
+      const remainder = rows % CYCLE;
+      const cycleStats = cyclePrefix[CYCLE];
+      const remainderStats = cyclePrefix[remainder];
+      return {
+        sum: fullCycles * cycleStats.sum + remainderStats.sum,
+        label1Count: fullCycles * cycleStats.label1Count + remainderStats.label1Count,
+        partition0Count: fullCycles * cycleStats.partition0Count + remainderStats.partition0Count,
+        partition1Count: fullCycles * cycleStats.partition1Count + remainderStats.partition1Count,
+      };
+    }
+
+    function statsForRange(startRow, endRow) {
+      const a = statsUpTo(startRow);
+      const b = statsUpTo(endRow);
+      return {
+        sum: b.sum - a.sum,
+        label1Count: b.label1Count - a.label1Count,
+        partition0Count: b.partition0Count - a.partition0Count,
+        partition1Count: b.partition1Count - a.partition1Count,
+      };
+    }
+
+    function buildAssignments(totalRows, workerCount) {
+      const assignments = [];
+      const chunkSize = Math.ceil(totalRows / workerCount);
+      for (let workerId = 0; workerId < workerCount; workerId++) {
+        const startRow = workerId * chunkSize;
+        const endRow = Math.min(startRow + chunkSize, totalRows);
+        if (startRow >= endRow) break;
+        assignments.push({ workerId, startRow, endRow, rows: endRow - startRow });
+      }
+      return assignments;
+    }
+
+    function mergePhaseResults(results) {
+      return results.reduce((acc, result) => {
+        acc.sum += result.sum;
+        acc.label1Count += result.label1Count;
+        acc.partition0Count += result.partition0Count;
+        acc.partition1Count += result.partition1Count;
+        acc.maxLoadMs = Math.max(acc.maxLoadMs, result.loadMs || 0);
+        acc.maxFillMs = Math.max(acc.maxFillMs, result.fillMs || 0);
+        acc.maxPolarsMs = Math.max(acc.maxPolarsMs, result.polarsMs || 0);
+        acc.maxSegments = Math.max(acc.maxSegments, result.segmentCount || 0);
+        return acc;
+      }, {
+        sum: 0,
+        label1Count: 0,
+        partition0Count: 0,
+        partition1Count: 0,
+        maxLoadMs: 0,
+        maxFillMs: 0,
+        maxPolarsMs: 0,
+        maxSegments: 0,
+      });
+    }
+
+    function nearlyEqual(a, b, tolerance = 1e-6) {
+      const scale = Math.max(1, Math.abs(a), Math.abs(b));
+      return Math.abs(a - b) <= tolerance * scale;
+    }
+
+    function createWorkerUrl() {
+      const source = `
+        import initPolars from '${POLARS_MODULE_URL}';
+
+        let cached = null;
+
+        function patternValue(globalIndex) {
+          return ((globalIndex % 1000) * 0.5) - 100.0;
+        }
+
+        function patternLabel(globalIndex) {
+          return (globalIndex % 3 === 0 || globalIndex % 5 === 0) ? 1 : 0;
+        }
+
+        function patternPartition(globalIndex) {
+          return globalIndex % 8;
+        }
+
+        async function getPolars() {
+          if (cached) return cached;
+          const startedAt = performance.now();
+          const response = await fetch('${POLARS_WASM_URL}');
+          const bytes = await response.arrayBuffer();
+          const polars = await initPolars(bytes);
+          const endedAt = performance.now();
+          cached = { polars, wasmSize: bytes.byteLength, loadMs: endedAt - startedAt };
+          return cached;
+        }
+
+        function buildSegments(rows, segmentRows, startRow) {
+          const segments = [];
+          let localStart = 0;
+          while (localStart < rows) {
+            const localEnd = Math.min(localStart + segmentRows, rows);
+            segments.push({ startRow: startRow + localStart, rows: localEnd - localStart });
+            localStart = localEnd;
+          }
+          return segments;
+        }
+
+        function fillChunkedSegments(polars, segments) {
+          const segmentCount = segments.length;
+          const featurePtrs = [];
+          const labelPtrs = [];
+          const partitionPtrs = [];
+          const lengths = segments.map((segment) => segment.rows);
+
+          for (const segment of segments) {
+            const featurePtr = polars.polars_alloc_f64_buffer(segment.rows);
+            const labelPtr = polars.polars_alloc_i32_buffer(segment.rows);
+            const partitionPtr = polars.polars_alloc_i32_buffer(segment.rows);
+            if (!featurePtr || !labelPtr || !partitionPtr) throw new Error('Chunked segment allocation failed.');
+            featurePtrs.push(featurePtr);
+            labelPtrs.push(labelPtr);
+            partitionPtrs.push(partitionPtr);
+          }
+
+          const lengthsPtr = polars.polars_alloc_u32_buffer(segmentCount);
+          const featurePtrsPtr = polars.polars_alloc_u32_buffer(segmentCount);
+          const labelPtrsPtr = polars.polars_alloc_u32_buffer(segmentCount);
+          const partitionPtrsPtr = polars.polars_alloc_u32_buffer(segmentCount);
+          if (!lengthsPtr || !featurePtrsPtr || !labelPtrsPtr || !partitionPtrsPtr) {
+            throw new Error('Chunked metadata allocation failed.');
+          }
+
+          const lengthsView = new Uint32Array(polars.memory.buffer, lengthsPtr, segmentCount);
+          const featurePtrsView = new Uint32Array(polars.memory.buffer, featurePtrsPtr, segmentCount);
+          const labelPtrsView = new Uint32Array(polars.memory.buffer, labelPtrsPtr, segmentCount);
+          const partitionPtrsView = new Uint32Array(polars.memory.buffer, partitionPtrsPtr, segmentCount);
+
+          for (let segmentIndex = 0; segmentIndex < segmentCount; segmentIndex++) {
+            const segment = segments[segmentIndex];
+            const featureView = new Float64Array(polars.memory.buffer, featurePtrs[segmentIndex], segment.rows);
+            const labelView = new Int32Array(polars.memory.buffer, labelPtrs[segmentIndex], segment.rows);
+            const partitionView = new Int32Array(polars.memory.buffer, partitionPtrs[segmentIndex], segment.rows);
+            for (let i = 0; i < segment.rows; i++) {
+              const globalIndex = segment.startRow + i;
+              featureView[i] = patternValue(globalIndex);
+              labelView[i] = patternLabel(globalIndex);
+              partitionView[i] = patternPartition(globalIndex);
+            }
+            lengthsView[segmentIndex] = segment.rows;
+            featurePtrsView[segmentIndex] = featurePtrs[segmentIndex];
+            labelPtrsView[segmentIndex] = labelPtrs[segmentIndex];
+            partitionPtrsView[segmentIndex] = partitionPtrs[segmentIndex];
+          }
+
+          return {
+            segmentCount,
+            featurePtrs,
+            labelPtrs,
+            partitionPtrs,
+            lengths,
+            lengthsPtr,
+            featurePtrsPtr,
+            labelPtrsPtr,
+            partitionPtrsPtr,
+          };
+        }
+
+        function freeChunkedSegments(polars, state) {
+          for (let i = 0; i < state.segmentCount; i++) {
+            polars.polars_free_f64_buffer(state.featurePtrs[i], state.lengths[i]);
+            polars.polars_free_i32_buffer(state.labelPtrs[i], state.lengths[i]);
+            polars.polars_free_i32_buffer(state.partitionPtrs[i], state.lengths[i]);
+          }
+          polars.polars_free_u32_buffer(state.lengthsPtr, state.segmentCount);
+          polars.polars_free_u32_buffer(state.featurePtrsPtr, state.segmentCount);
+          polars.polars_free_u32_buffer(state.labelPtrsPtr, state.segmentCount);
+          polars.polars_free_u32_buffer(state.partitionPtrsPtr, state.segmentCount);
+        }
+
+        self.onmessage = async (event) => {
+          const { workerId, phase, startRow, rows, segmentRows } = event.data;
+          try {
+            const { polars, wasmSize, loadMs } = await getPolars();
+
+            if (phase === 'generated') {
+              const startedAt = performance.now();
+              const sum = polars.polars_generated_sum_offset(startRow, rows);
+              const endedAt = performance.now();
+              self.postMessage({
+                ok: true,
+                workerId,
+                phase,
+                startRow,
+                rows,
+                segmentCount: 1,
+                wasmSize,
+                loadMs,
+                fillMs: 0,
+                polarsMs: endedAt - startedAt,
+                sum,
+                label1Count: polars.polars_last_label1_count(),
+                partition0Count: polars.polars_last_partition0_count(),
+                partition1Count: polars.polars_last_partition1_count(),
+              });
+              return;
+            }
+
+            if (phase === 'arena') {
+              const fillStartedAt = performance.now();
+              const featurePtr = polars.polars_alloc_f64_buffer(rows);
+              const labelPtr = polars.polars_alloc_i32_buffer(rows);
+              const partitionPtr = polars.polars_alloc_i32_buffer(rows);
+              if (!featurePtr || !labelPtr || !partitionPtr) throw new Error('Arena allocation failed.');
+              const featureView = new Float64Array(polars.memory.buffer, featurePtr, rows);
+              const labelView = new Int32Array(polars.memory.buffer, labelPtr, rows);
+              const partitionView = new Int32Array(polars.memory.buffer, partitionPtr, rows);
+              for (let i = 0; i < rows; i++) {
+                const globalIndex = startRow + i;
+                featureView[i] = patternValue(globalIndex);
+                labelView[i] = patternLabel(globalIndex);
+                partitionView[i] = patternPartition(globalIndex);
+              }
+              const fillEndedAt = performance.now();
+              const polarsStartedAt = performance.now();
+              const sum = polars.polars_from_owned_buffers(featurePtr, labelPtr, partitionPtr, rows);
+              const polarsEndedAt = performance.now();
+              self.postMessage({
+                ok: true,
+                workerId,
+                phase,
+                startRow,
+                rows,
+                segmentCount: 1,
+                wasmSize,
+                loadMs,
+                fillMs: fillEndedAt - fillStartedAt,
+                polarsMs: polarsEndedAt - polarsStartedAt,
+                sum,
+                label1Count: polars.polars_last_label1_count(),
+                partition0Count: polars.polars_last_partition0_count(),
+                partition1Count: polars.polars_last_partition1_count(),
+              });
+              return;
+            }
+
+            if (phase === 'chunked') {
+              const segments = buildSegments(rows, segmentRows, startRow);
+              const fillStartedAt = performance.now();
+              const state = fillChunkedSegments(polars, segments);
+              const fillEndedAt = performance.now();
+              const polarsStartedAt = performance.now();
+              const sum = polars.polars_from_chunked_segment_buffers(
+                state.featurePtrsPtr,
+                state.labelPtrsPtr,
+                state.partitionPtrsPtr,
+                state.lengthsPtr,
+                state.segmentCount,
+              );
+              const polarsEndedAt = performance.now();
+              const result = {
+                ok: true,
+                workerId,
+                phase,
+                startRow,
+                rows,
+                segmentCount: state.segmentCount,
+                wasmSize,
+                loadMs,
+                fillMs: fillEndedAt - fillStartedAt,
+                polarsMs: polarsEndedAt - polarsStartedAt,
+                sum,
+                label1Count: polars.polars_last_label1_count(),
+                partition0Count: polars.polars_last_partition0_count(),
+                partition1Count: polars.polars_last_partition1_count(),
+              };
+              freeChunkedSegments(polars, state);
+              self.postMessage(result);
+              return;
+            }
+
+            throw new Error('Unknown phase: ' + phase);
+          } catch (error) {
+            self.postMessage({ ok: false, workerId, phase, error: error.message || String(error) });
+          }
+        };
+      `;
+      return URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    }
+
+    function spawnWorkers(assignments) {
+      const workerUrl = createWorkerUrl();
+      const workers = assignments.map((assignment) => ({ assignment, worker: new Worker(workerUrl, { type: 'module' }) }));
+      return { workerUrl, workers };
+    }
+
+    function destroyWorkers(workerSet) {
+      for (const entry of workerSet.workers) entry.worker.terminate();
+      URL.revokeObjectURL(workerSet.workerUrl);
+    }
+
+    async function runPhase(workerSet, phase, segmentRows) {
+      const startedAt = performance.now();
+      const results = await Promise.all(workerSet.workers.map(({ assignment, worker }) => new Promise((resolve, reject) => {
+        const onMessage = (event) => {
+          const data = event.data;
+          cleanup();
+          if (!data.ok) {
+            reject(new Error(`Worker ${data.workerId} ${phase} failed: ${data.error}`));
+            return;
+          }
+          resolve(data);
+        };
+        const onError = (error) => {
+          cleanup();
+          reject(error);
+        };
+        const cleanup = () => {
+          worker.removeEventListener('message', onMessage);
+          worker.removeEventListener('error', onError);
+        };
+        worker.addEventListener('message', onMessage);
+        worker.addEventListener('error', onError);
+        worker.postMessage({
+          workerId: assignment.workerId,
+          phase,
+          startRow: assignment.startRow,
+          rows: assignment.rows,
+          segmentRows,
+        });
+      })));
+      const endedAt = performance.now();
+      return { results, wallMs: endedAt - startedAt };
+    }
+
+    async function runProof() {
+      const totalRows = Math.trunc(Number(rowsInput.value));
+      const workerCount = Math.trunc(Number(workerCountInput.value));
+      const segmentRows = Math.trunc(Number(segmentRowsInput.value));
+      if (!Number.isFinite(totalRows) || totalRows <= 0) {
+        setStatus('bad', 'Invalid row count.');
+        return;
+      }
+      if (!Number.isFinite(workerCount) || workerCount <= 0) {
+        setStatus('bad', 'Invalid worker count.');
+        return;
+      }
+      if (!Number.isFinite(segmentRows) || segmentRows <= 0) {
+        setStatus('bad', 'Invalid segment rows.');
+        return;
+      }
+
+      runBtn.disabled = true;
+      logEl.textContent = '';
+      resultEl.textContent = '';
+      setStatus('warn', 'Running distributed chunked-shim comparison...');
+
+      try {
+        const assignments = buildAssignments(totalRows, workerCount).map((assignment) => ({
+          ...assignment,
+          segmentCount: Math.ceil(assignment.rows / segmentRows),
+        }));
+        manifestEl.textContent = JSON.stringify({ totalRows, workerCount: assignments.length, segmentRows, assignments }, null, 2);
+        log(`Running distributed chunked-shim comparison for ${formatNumber(totalRows, 0)} rows across ${assignments.length} worker(s).`);
+
+        const reference = statsForRange(0, totalRows);
+        $('jsSumValue').textContent = formatNumber(reference.sum, 4);
+        $('jsCountValue').textContent = formatNumber(reference.label1Count, 0);
+        $('chunkedSegmentsValue').textContent = formatNumber(Math.max(0, ...assignments.map((assignment) => assignment.segmentCount)), 0);
+
+        const workerSet = spawnWorkers(assignments);
+        let generatedPhase;
+        let arenaPhase;
+        let chunkedPhase;
+        try {
+          log('Phase 1: distributed Polars-generated baseline...');
+          generatedPhase = await runPhase(workerSet, 'generated', segmentRows);
+
+          log('Phase 2: distributed worker-local partition arena...');
+          arenaPhase = await runPhase(workerSet, 'arena', segmentRows);
+
+          log('Phase 3: distributed earlier chunked shim...');
+          chunkedPhase = await runPhase(workerSet, 'chunked', segmentRows);
+        } finally {
+          destroyWorkers(workerSet);
+        }
+
+        const generatedMerged = mergePhaseResults(generatedPhase.results);
+        const arenaMerged = mergePhaseResults(arenaPhase.results);
+        const chunkedMerged = mergePhaseResults(chunkedPhase.results);
+        const wasmSize = Math.max(
+          0,
+          ...generatedPhase.results.map((result) => result.wasmSize || 0),
+          ...arenaPhase.results.map((result) => result.wasmSize || 0),
+          ...chunkedPhase.results.map((result) => result.wasmSize || 0),
+        );
+        const workerInitMax = Math.max(generatedMerged.maxLoadMs, arenaMerged.maxLoadMs, chunkedMerged.maxLoadMs);
+
+        $('wasmSizeValue').textContent = formatBytes(wasmSize);
+        $('workerInitValue').textContent = `${workerInitMax.toFixed(1)} ms`;
+        $('generatedWallValue').textContent = `${generatedPhase.wallMs.toFixed(1)} ms`;
+        $('arenaWallValue').textContent = `${arenaPhase.wallMs.toFixed(1)} ms`;
+        $('chunkedWallValue').textContent = `${chunkedPhase.wallMs.toFixed(1)} ms`;
+        $('arenaFillValue').textContent = `${arenaMerged.maxFillMs.toFixed(1)} ms`;
+        $('arenaPolarsValue').textContent = `${arenaMerged.maxPolarsMs.toFixed(1)} ms`;
+        $('chunkedFillValue').textContent = `${chunkedMerged.maxFillMs.toFixed(1)} ms`;
+        $('chunkedPolarsValue').textContent = `${chunkedMerged.maxPolarsMs.toFixed(1)} ms`;
+        $('generatedSumValue').textContent = formatNumber(generatedMerged.sum, 4);
+        $('arenaSumValue').textContent = formatNumber(arenaMerged.sum, 4);
+        $('chunkedSumValue').textContent = formatNumber(chunkedMerged.sum, 4);
+        $('chunkedCountValue').textContent = formatNumber(chunkedMerged.label1Count, 0);
+
+        const generatedSuccess =
+          nearlyEqual(generatedMerged.sum, reference.sum) &&
+          generatedMerged.label1Count === reference.label1Count &&
+          generatedMerged.partition0Count === reference.partition0Count &&
+          generatedMerged.partition1Count === reference.partition1Count;
+
+        const arenaSuccess =
+          nearlyEqual(arenaMerged.sum, reference.sum) &&
+          arenaMerged.label1Count === reference.label1Count &&
+          arenaMerged.partition0Count === reference.partition0Count &&
+          arenaMerged.partition1Count === reference.partition1Count;
+
+        const chunkedSuccess =
+          nearlyEqual(chunkedMerged.sum, reference.sum) &&
+          chunkedMerged.label1Count === reference.label1Count &&
+          chunkedMerged.partition0Count === reference.partition0Count &&
+          chunkedMerged.partition1Count === reference.partition1Count;
+
+        const success = generatedSuccess && arenaSuccess && chunkedSuccess;
+        resultEl.textContent = JSON.stringify({
+          totalRows,
+          workerCount: assignments.length,
+          segmentRows,
+          generatedPhase: {
+            wallMs: generatedPhase.wallMs,
+            merged: generatedMerged,
+            workers: generatedPhase.results,
+            success: generatedSuccess,
+          },
+          arenaPhase: {
+            wallMs: arenaPhase.wallMs,
+            merged: arenaMerged,
+            workers: arenaPhase.results,
+            success: arenaSuccess,
+          },
+          chunkedPhase: {
+            wallMs: chunkedPhase.wallMs,
+            merged: chunkedMerged,
+            workers: chunkedPhase.results,
+            success: chunkedSuccess,
+          },
+          jsReference: reference,
+          success,
+        }, null, 2);
+
+        if (success) {
+          setStatus('good', `Distributed chunked-shim comparison passed for ${formatNumber(totalRows, 0)} rows across ${assignments.length} workers.`);
+        } else {
+          setStatus('bad', 'Distributed chunked-shim comparison mismatch.');
+        }
+
+        log(`Generated wall=${generatedPhase.wallMs.toFixed(1)} ms, arena wall=${arenaPhase.wallMs.toFixed(1)} ms, chunked wall=${chunkedPhase.wallMs.toFixed(1)} ms, chunked Polars max=${chunkedMerged.maxPolarsMs.toFixed(1)} ms, success=${success}`);
+      } catch (error) {
+        setStatus('bad', `Distributed chunked-shim comparison failed: ${error.message || error}`);
+        log(`FAIL: ${error.message || error}`);
+      } finally {
+        runBtn.disabled = false;
+      }
+    }
+
+    runBtn.addEventListener('click', () => {
+      runProof().catch((error) => {
+        setStatus('bad', `Distributed chunked-shim comparison failed: ${error.message || error}`);
+        log(`Unhandled error: ${error.message || error}`);
+        runBtn.disabled = false;
+      });
+    });
+
+    manifestEl.textContent = 'No worker partition plan yet.';
+    resultEl.textContent = 'No result yet.';
+    log('Ready. This page compares distributed generated baseline, distributed arena ingestion, and distributed chunked-shim ingestion on equal worker count.');
+  </script>
+</body>
+</html>

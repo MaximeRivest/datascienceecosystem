@@ -1,0 +1,700 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Polars Arrow-View Live Workers</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #121a33;
+      --panel-2: #0f1730;
+      --text: #e7ecff;
+      --muted: #a6b0d5;
+      --good: #66e3a4;
+      --warn: #ffd166;
+      --bad: #ff7b7b;
+      --border: #26345f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #0a0f1d, #0b1020 40%, #0d1327);
+      color: var(--text);
+    }
+    .wrap { max-width: 1240px; margin: 0 auto; padding: 32px 20px 48px; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { margin: 8px 0; color: var(--muted); }
+    .card {
+      background: rgba(18, 26, 51, 0.9);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      margin-top: 18px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.22);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    input, button {
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+    }
+    button {
+      border: 0;
+      background: linear-gradient(180deg, #1c6fff, #1758cc);
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .danger { background: linear-gradient(180deg, #c14444, #9e2f2f); }
+    .status {
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #101833;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
+    .status.good { border-color: rgba(102, 227, 164, .35); color: var(--good); }
+    .status.warn { border-color: rgba(255, 209, 102, .35); color: var(--warn); }
+    .status.bad { border-color: rgba(255, 123, 123, .35); color: var(--bad); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .metric {
+      background: #0e1630;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .metric .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .metric .value { margin-top: 8px; font-size: 22px; font-weight: 800; }
+    pre {
+      margin: 0;
+      background: #0b1228;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+      max-height: 360px;
+      color: #cfe0ff;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .small { font-size: 12px; color: var(--muted); }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Polars Arrow-View Live Workers</h1>
+    <p>
+      This is the closest currently implementable direct follow-on to the live Arrow-style shard-bank view proof. It uses the same shared bank + manifest,
+      runs a fresh-worker <strong>live-view aggregate</strong>, and in parallel runs a fresh-worker <strong>Polars-from-bank</strong> path where workers materialize Polars-owned arenas directly from the live bank partitions they were assigned.
+    </p>
+    <p class="small">
+      Important nuance: with the current browser Polars Wasm packaging, this page does <strong>not</strong> yet make Polars read external shared bank memory directly.
+      Instead, it proves that Polars can consume data directly from the real live bank manifest in fresh workers and that both the live-view path and the Polars path track shared-bank mutations exactly.
+    </p>
+
+    <div id="status" class="status warn">Ready. Build the shared bank, run live-view workers and Polars-from-bank workers, then verify mutation tracking.</div>
+
+    <div class="card">
+      <strong>Live-view + Polars setup</strong>
+      <div class="grid">
+        <label>
+          Total rows
+          <input id="rowsInput" type="number" min="1" step="1000000" value="38500000" />
+        </label>
+        <label>
+          Partition rows
+          <input id="partitionRowsInput" type="number" min="1" step="100000" value="2048000" />
+        </label>
+        <label>
+          Worker count
+          <input id="workerCountInput" type="number" min="1" max="16" step="1" value="4" />
+        </label>
+        <label>
+          Shard size (MiB)
+          <input id="shardMiBInput" type="number" min="16" step="16" value="256" />
+        </label>
+        <label>
+          Mutation delta
+          <input id="deltaInput" type="number" step="1" value="1000" />
+        </label>
+      </div>
+      <div class="row">
+        <button id="runBtn">Run live-view + Polars proof</button>
+        <button id="releaseBtn" class="danger">Release bank</button>
+      </div>
+      <p class="small">
+        The Polars workers build their local arenas by reading from the real shared-bank manifest, not by regenerating the synthetic pattern independently.
+      </p>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="label">Shards</div><div id="shardCountValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Bank size</div><div id="bankSizeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Used bytes</div><div id="usedBytesValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Partitions</div><div id="partitionCountValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Build/fill time</div><div id="buildTimeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Live wall</div><div id="liveWallValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Polars wall</div><div id="polarsWallValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Polars init max</div><div id="polarsInitValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Polars fill max</div><div id="polarsFillValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Polars compute max</div><div id="polarsComputeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Live sum</div><div id="liveSumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Polars sum</div><div id="polarsSumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Mutated live sum</div><div id="mutatedLiveSumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Mutated Polars sum</div><div id="mutatedPolarsSumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Expected delta</div><div id="expectedDeltaValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Observed live delta</div><div id="liveDeltaValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Observed Polars delta</div><div id="polarsDeltaValue" class="value">-</div></div>
+      <div class="metric"><div class="label">JS sum</div><div id="jsSumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Chrome heap used*</div><div id="heapValue" class="value">-</div></div>
+    </div>
+
+    <div class="card">
+      <strong>Manifest</strong>
+      <pre id="manifest"></pre>
+    </div>
+
+    <div class="card">
+      <strong>Result</strong>
+      <pre id="result"></pre>
+    </div>
+
+    <div class="card">
+      <strong>Log</strong>
+      <pre id="log"></pre>
+    </div>
+  </div>
+
+  <script type="module">
+    const POLARS_MODULE_URL = new URL('./polars-web/polars_spike.js', import.meta.url).href;
+    const POLARS_WASM_URL = new URL('./polars-web/polars_spike_bg.wasm', import.meta.url).href;
+    const $ = (id) => document.getElementById(id);
+    const statusEl = $('status');
+    const manifestEl = $('manifest');
+    const resultEl = $('result');
+    const logEl = $('log');
+    const runBtn = $('runBtn');
+    const releaseBtn = $('releaseBtn');
+    const rowsInput = $('rowsInput');
+    const partitionRowsInput = $('partitionRowsInput');
+    const workerCountInput = $('workerCountInput');
+    const shardMiBInput = $('shardMiBInput');
+    const deltaInput = $('deltaInput');
+
+    const CYCLE = 3000;
+    const cyclePrefix = buildCyclePrefix();
+    let memories = [];
+    let manifest = null;
+    let usedBytes = 0;
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      logEl.textContent += `[${time}] ${message}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setStatus(kind, text) {
+      statusEl.className = `status ${kind}`;
+      statusEl.textContent = text;
+    }
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes)) return '-';
+      const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+      let value = bytes;
+      let index = 0;
+      while (value >= 1024 && index < units.length - 1) {
+        value /= 1024;
+        index++;
+      }
+      return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[index]}`;
+    }
+
+    function formatNumber(value, digits = 2) {
+      if (!Number.isFinite(value)) return '-';
+      return new Intl.NumberFormat(undefined, {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: digits,
+      }).format(value);
+    }
+
+    function updateHeapMetric() {
+      if (performance.memory && Number.isFinite(performance.memory.usedJSHeapSize)) {
+        $('heapValue').textContent = formatBytes(performance.memory.usedJSHeapSize);
+      } else {
+        $('heapValue').textContent = 'n/a';
+      }
+    }
+
+    function buildCyclePrefix() {
+      const prefix = [{ sum: 0, label1Count: 0, partition0Count: 0, partition1Count: 0 }];
+      let sum = 0;
+      let label1Count = 0;
+      let partition0Count = 0;
+      let partition1Count = 0;
+      for (let i = 0; i < CYCLE; i++) {
+        const value = ((i % 1000) * 0.5) - 100.0;
+        const label = (i % 3 === 0 || i % 5 === 0) ? 1 : 0;
+        const partition = i % 8;
+        if (partition === 0) partition0Count++;
+        else if (partition === 1) partition1Count++;
+        if (label === 1) {
+          sum += value;
+          label1Count++;
+        }
+        prefix.push({ sum, label1Count, partition0Count, partition1Count });
+      }
+      return prefix;
+    }
+
+    function statsUpTo(rows) {
+      const fullCycles = Math.floor(rows / CYCLE);
+      const remainder = rows % CYCLE;
+      const cycleStats = cyclePrefix[CYCLE];
+      const remainderStats = cyclePrefix[remainder];
+      return {
+        sum: fullCycles * cycleStats.sum + remainderStats.sum,
+        label1Count: fullCycles * cycleStats.label1Count + remainderStats.label1Count,
+        partition0Count: fullCycles * cycleStats.partition0Count + remainderStats.partition0Count,
+        partition1Count: fullCycles * cycleStats.partition1Count + remainderStats.partition1Count,
+      };
+    }
+
+    function statsForRange(startRow, endRow) {
+      const a = statsUpTo(startRow);
+      const b = statsUpTo(endRow);
+      return {
+        sum: b.sum - a.sum,
+        label1Count: b.label1Count - a.label1Count,
+        partition0Count: b.partition0Count - a.partition0Count,
+        partition1Count: b.partition1Count - a.partition1Count,
+      };
+    }
+
+    function totalBankBytes() {
+      return memories.reduce((sum, memory) => sum + memory.buffer.byteLength, 0);
+    }
+
+    function releaseAll() {
+      memories = [];
+      manifest = null;
+      usedBytes = 0;
+      manifestEl.textContent = 'No manifest yet.';
+      resultEl.textContent = 'No result yet.';
+      for (const id of ['shardCountValue','bankSizeValue','usedBytesValue','partitionCountValue','buildTimeValue','liveWallValue','polarsWallValue','polarsInitValue','polarsFillValue','polarsComputeValue','liveSumValue','polarsSumValue','mutatedLiveSumValue','mutatedPolarsSumValue','expectedDeltaValue','liveDeltaValue','polarsDeltaValue','jsSumValue']) {
+        $(id).textContent = '-';
+      }
+      updateHeapMetric();
+      setStatus('warn', 'Released shared bank references.');
+      log('Released shared bank references.');
+    }
+
+    class SingleChunkRouter {
+      constructor(memories) {
+        this.memories = memories;
+        this.shardIndex = 0;
+        this.offset = 0;
+      }
+      align(alignment) {
+        const rem = this.offset % alignment;
+        if (rem !== 0) this.offset += alignment - rem;
+      }
+      reserve(byteLength, alignment) {
+        this.align(alignment);
+        while (this.shardIndex < this.memories.length) {
+          const buffer = this.memories[this.shardIndex].buffer;
+          const remaining = buffer.byteLength - this.offset;
+          if (remaining >= byteLength) {
+            const ref = { shardId: this.shardIndex, byteOffset: this.offset, byteLength };
+            this.offset += byteLength;
+            usedBytes = Math.max(usedBytes, this.shardIndex * buffer.byteLength + this.offset);
+            return ref;
+          }
+          this.shardIndex++;
+          this.offset = 0;
+        }
+        throw new Error(`Out of shards while reserving ${formatBytes(byteLength)}.`);
+      }
+    }
+
+    function createBank(totalRows, partitionRows, shardMiB) {
+      const bytesPerRow = 8 + 4 + 4;
+      const overheadBytes = Math.ceil(totalRows / partitionRows) * 512;
+      const requiredBytes = totalRows * bytesPerRow + overheadBytes;
+      const shardBytes = shardMiB * 1024 * 1024;
+      if (shardBytes % 65536 !== 0) throw new Error('Shard size must align to 64 KiB wasm pages.');
+      const shardPages = shardBytes / 65536;
+      const shardCount = Math.max(1, Math.ceil(requiredBytes / shardBytes));
+      memories = [];
+      usedBytes = 0;
+      for (let i = 0; i < shardCount; i++) {
+        memories.push(new WebAssembly.Memory({ shared: true, initial: shardPages, maximum: shardPages }));
+      }
+      return { requiredBytes, shardBytes, shardCount };
+    }
+
+    function fillBankAndManifest(totalRows, partitionRows) {
+      const router = new SingleChunkRouter(memories);
+      const partitions = [];
+      let startRow = 0;
+      while (startRow < totalRows) {
+        const rows = Math.min(partitionRows, totalRows - startRow);
+        const featureRef = router.reserve(rows * Float64Array.BYTES_PER_ELEMENT, Float64Array.BYTES_PER_ELEMENT);
+        const labelRef = router.reserve(rows * Int32Array.BYTES_PER_ELEMENT, Int32Array.BYTES_PER_ELEMENT);
+        const partitionRef = router.reserve(rows * Int32Array.BYTES_PER_ELEMENT, Int32Array.BYTES_PER_ELEMENT);
+        const featureView = new Float64Array(memories[featureRef.shardId].buffer, featureRef.byteOffset, rows);
+        const labelView = new Int32Array(memories[labelRef.shardId].buffer, labelRef.byteOffset, rows);
+        const partitionView = new Int32Array(memories[partitionRef.shardId].buffer, partitionRef.byteOffset, rows);
+        for (let i = 0; i < rows; i++) {
+          const globalIndex = startRow + i;
+          featureView[i] = ((globalIndex % 1000) * 0.5) - 100.0;
+          labelView[i] = (globalIndex % 3 === 0 || globalIndex % 5 === 0) ? 1 : 0;
+          partitionView[i] = globalIndex % 8;
+        }
+        partitions.push({
+          partitionId: partitions.length,
+          rowOffset: startRow,
+          rowCount: rows,
+          columns: {
+            feature_a: { rowOffset: startRow, rowCount: rows, values: featureRef },
+            label: { rowOffset: startRow, rowCount: rows, values: labelRef },
+            partition: { rowOffset: startRow, rowCount: rows, values: partitionRef },
+          },
+        });
+        startRow += rows;
+      }
+      manifest = {
+        schema: [
+          { name: 'feature_a', logicalType: 'f64' },
+          { name: 'label', logicalType: 'i32' },
+          { name: 'partition', logicalType: 'i32' },
+        ],
+        partitions,
+        totalRows,
+      };
+      return manifest;
+    }
+
+    function buildAssignments(partitions, workerCount) {
+      const buckets = Array.from({ length: workerCount }, (_, workerId) => ({ workerId, partitions: [] }));
+      partitions.forEach((partition, index) => buckets[index % workerCount].partitions.push(partition));
+      return buckets.filter((bucket) => bucket.partitions.length > 0);
+    }
+
+    function createWorkerUrl() {
+      const source = `
+        let polarsCache = null;
+
+        async function getPolars() {
+          if (polarsCache) return polarsCache;
+          const startedAt = performance.now();
+          const mod = await import('${POLARS_MODULE_URL}');
+          const response = await fetch('${POLARS_WASM_URL}');
+          const bytes = await response.arrayBuffer();
+          const polars = await mod.default(bytes);
+          const endedAt = performance.now();
+          polarsCache = { polars, wasmSize: bytes.byteLength, loadMs: endedAt - startedAt };
+          return polarsCache;
+        }
+
+        function aggregateLive(memories, partitions) {
+          let sum = 0;
+          let label1Count = 0;
+          let partition0Count = 0;
+          let partition1Count = 0;
+          for (const partition of partitions) {
+            const featureRef = partition.columns.feature_a.values;
+            const labelRef = partition.columns.label.values;
+            const partitionRef = partition.columns.partition.values;
+            const feature = new Float64Array(memories[featureRef.shardId].buffer, featureRef.byteOffset, partition.rowCount);
+            const label = new Int32Array(memories[labelRef.shardId].buffer, labelRef.byteOffset, partition.rowCount);
+            const part = new Int32Array(memories[partitionRef.shardId].buffer, partitionRef.byteOffset, partition.rowCount);
+            for (let i = 0; i < partition.rowCount; i++) {
+              if (part[i] === 0) partition0Count++;
+              else if (part[i] === 1) partition1Count++;
+              if (label[i] === 1) {
+                label1Count++;
+                sum += feature[i];
+              }
+            }
+          }
+          return { sum, label1Count, partition0Count, partition1Count };
+        }
+
+        async function aggregatePolars(memories, partitions) {
+          const { polars, wasmSize, loadMs } = await getPolars();
+          const totalRows = partitions.reduce((acc, partition) => acc + partition.rowCount, 0);
+          const fillStartedAt = performance.now();
+          const featurePtr = polars.polars_alloc_f64_buffer(totalRows);
+          const labelPtr = polars.polars_alloc_i32_buffer(totalRows);
+          const partitionPtr = polars.polars_alloc_i32_buffer(totalRows);
+          if (!featurePtr || !labelPtr || !partitionPtr) {
+            throw new Error('Polars arena allocation failed in worker.');
+          }
+          const featureOut = new Float64Array(polars.memory.buffer, featurePtr, totalRows);
+          const labelOut = new Int32Array(polars.memory.buffer, labelPtr, totalRows);
+          const partitionOut = new Int32Array(polars.memory.buffer, partitionPtr, totalRows);
+          let cursor = 0;
+          for (const partition of partitions) {
+            const featureRef = partition.columns.feature_a.values;
+            const labelRef = partition.columns.label.values;
+            const partitionRef = partition.columns.partition.values;
+            const featureIn = new Float64Array(memories[featureRef.shardId].buffer, featureRef.byteOffset, partition.rowCount);
+            const labelIn = new Int32Array(memories[labelRef.shardId].buffer, labelRef.byteOffset, partition.rowCount);
+            const partitionIn = new Int32Array(memories[partitionRef.shardId].buffer, partitionRef.byteOffset, partition.rowCount);
+            featureOut.set(featureIn, cursor);
+            labelOut.set(labelIn, cursor);
+            partitionOut.set(partitionIn, cursor);
+            cursor += partition.rowCount;
+          }
+          const fillEndedAt = performance.now();
+          const polarsStartedAt = performance.now();
+          const sum = polars.polars_from_owned_buffers(featurePtr, labelPtr, partitionPtr, totalRows);
+          const polarsEndedAt = performance.now();
+          return {
+            wasmSize,
+            loadMs,
+            fillMs: fillEndedAt - fillStartedAt,
+            polarsMs: polarsEndedAt - polarsStartedAt,
+            sum,
+            label1Count: polars.polars_last_label1_count(),
+            partition0Count: polars.polars_last_partition0_count(),
+            partition1Count: polars.polars_last_partition1_count(),
+          };
+        }
+
+        self.onmessage = async (event) => {
+          const { workerId, mode, memories, partitions } = event.data;
+          try {
+            if (mode === 'live') {
+              const startedAt = performance.now();
+              const agg = aggregateLive(memories, partitions);
+              const endedAt = performance.now();
+              self.postMessage({ ok: true, workerId, mode, partitions: partitions.length, rows: partitions.reduce((a,p) => a + p.rowCount, 0), durationMs: endedAt - startedAt, ...agg });
+              return;
+            }
+
+            if (mode === 'polars') {
+              const startedAt = performance.now();
+              const agg = await aggregatePolars(memories, partitions);
+              const endedAt = performance.now();
+              self.postMessage({ ok: true, workerId, mode, partitions: partitions.length, rows: partitions.reduce((a,p) => a + p.rowCount, 0), wallMs: endedAt - startedAt, ...agg });
+              return;
+            }
+
+            throw new Error('Unknown mode: ' + mode);
+          } catch (error) {
+            self.postMessage({ ok: false, workerId, mode, error: error.message || String(error) });
+          }
+        };
+      `;
+      return URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    }
+
+    async function runWorkerPhase(assignments, mode) {
+      const workerUrl = createWorkerUrl();
+      const startedAt = performance.now();
+      const results = await Promise.all(assignments.map((assignment) => new Promise((resolve, reject) => {
+        const worker = new Worker(workerUrl, { type: 'module' });
+        worker.onmessage = (event) => {
+          const data = event.data;
+          worker.terminate();
+          if (!data.ok) {
+            reject(new Error(`Worker ${assignment.workerId} ${mode} failed: ${data.error}`));
+            return;
+          }
+          resolve(data);
+        };
+        worker.onerror = (error) => {
+          worker.terminate();
+          reject(error);
+        };
+        worker.postMessage({ workerId: assignment.workerId, mode, memories, partitions: assignment.partitions });
+      })));
+      URL.revokeObjectURL(workerUrl);
+      const endedAt = performance.now();
+      const merged = results.reduce((acc, result) => {
+        acc.sum += result.sum;
+        acc.label1Count += result.label1Count;
+        acc.partition0Count += result.partition0Count;
+        acc.partition1Count += result.partition1Count;
+        acc.maxWorkerMs = Math.max(acc.maxWorkerMs, result.durationMs || result.wallMs || 0);
+        acc.maxLoadMs = Math.max(acc.maxLoadMs, result.loadMs || 0);
+        acc.maxFillMs = Math.max(acc.maxFillMs, result.fillMs || 0);
+        acc.maxPolarsMs = Math.max(acc.maxPolarsMs, result.polarsMs || 0);
+        return acc;
+      }, { sum: 0, label1Count: 0, partition0Count: 0, partition1Count: 0, maxWorkerMs: 0, maxLoadMs: 0, maxFillMs: 0, maxPolarsMs: 0 });
+      return { results, merged, wallMs: endedAt - startedAt };
+    }
+
+    function mutateLabel1Value(delta) {
+      if (!manifest || !manifest.partitions.length) throw new Error('No manifest available.');
+      const targetPartition = manifest.partitions[0];
+      const featureRef = targetPartition.columns.feature_a.values;
+      const labelRef = targetPartition.columns.label.values;
+      const feature = new Float64Array(memories[featureRef.shardId].buffer, featureRef.byteOffset, targetPartition.rowCount);
+      const label = new Int32Array(memories[labelRef.shardId].buffer, labelRef.byteOffset, targetPartition.rowCount);
+      let localIndex = -1;
+      for (let i = 0; i < targetPartition.rowCount; i++) {
+        if (label[i] === 1) { localIndex = i; break; }
+      }
+      if (localIndex === -1) throw new Error('No label=1 row found for mutation.');
+      const globalIndex = targetPartition.rowOffset + localIndex;
+      const before = feature[localIndex];
+      feature[localIndex] = before + delta;
+      return { partitionId: targetPartition.partitionId, localIndex, globalIndex, before, after: feature[localIndex], expectedDelta: delta };
+    }
+
+    async function runProof() {
+      const totalRows = Math.trunc(Number(rowsInput.value));
+      const partitionRows = Math.trunc(Number(partitionRowsInput.value));
+      const workerCount = Math.trunc(Number(workerCountInput.value));
+      const shardMiB = Math.trunc(Number(shardMiBInput.value));
+      const delta = Number(deltaInput.value);
+      if (!Number.isFinite(totalRows) || totalRows <= 0) return setStatus('bad', 'Invalid total rows.');
+      if (!Number.isFinite(partitionRows) || partitionRows <= 0) return setStatus('bad', 'Invalid partition rows.');
+      if (!Number.isFinite(workerCount) || workerCount <= 0) return setStatus('bad', 'Invalid worker count.');
+      if (!Number.isFinite(shardMiB) || shardMiB <= 0) return setStatus('bad', 'Invalid shard size.');
+      if (!Number.isFinite(delta) || delta === 0) return setStatus('bad', 'Invalid mutation delta.');
+
+      runBtn.disabled = true;
+      logEl.textContent = '';
+      resultEl.textContent = '';
+      setStatus('warn', 'Building shared bank and manifest...');
+      try {
+        const buildStartedAt = performance.now();
+        const bankInfo = createBank(totalRows, partitionRows, shardMiB);
+        fillBankAndManifest(totalRows, partitionRows);
+        const buildEndedAt = performance.now();
+        const assignments = buildAssignments(manifest.partitions, workerCount);
+        const reference = statsForRange(0, totalRows);
+
+        $('shardCountValue').textContent = formatNumber(memories.length, 0);
+        $('bankSizeValue').textContent = formatBytes(totalBankBytes());
+        $('usedBytesValue').textContent = formatBytes(usedBytes);
+        $('partitionCountValue').textContent = formatNumber(manifest.partitions.length, 0);
+        $('buildTimeValue').textContent = `${(buildEndedAt - buildStartedAt).toFixed(1)} ms`;
+        $('jsSumValue').textContent = formatNumber(reference.sum, 4);
+
+        manifestEl.textContent = JSON.stringify({
+          totalRows,
+          partitionRows,
+          workerCount: assignments.length,
+          shardMiB,
+          shardCount: memories.length,
+          requiredBytes: bankInfo.requiredBytes,
+          usedBytes,
+          partitionCount: manifest.partitions.length,
+          assignments: assignments.map((assignment) => ({
+            workerId: assignment.workerId,
+            partitions: assignment.partitions.map((partition) => ({ partitionId: partition.partitionId, rowOffset: partition.rowOffset, rowCount: partition.rowCount })),
+          })),
+        }, null, 2);
+
+        log(`Running live-view workers over ${formatNumber(totalRows, 0)} rows, ${formatNumber(manifest.partitions.length, 0)} partitions, ${assignments.length} workers.`);
+        const liveInitial = await runWorkerPhase(assignments, 'live');
+        const polarsInitial = await runWorkerPhase(assignments, 'polars');
+
+        $('liveWallValue').textContent = `${liveInitial.wallMs.toFixed(1)} ms`;
+        $('polarsWallValue').textContent = `${polarsInitial.wallMs.toFixed(1)} ms`;
+        $('polarsInitValue').textContent = `${polarsInitial.merged.maxLoadMs.toFixed(1)} ms`;
+        $('polarsFillValue').textContent = `${polarsInitial.merged.maxFillMs.toFixed(1)} ms`;
+        $('polarsComputeValue').textContent = `${polarsInitial.merged.maxPolarsMs.toFixed(1)} ms`;
+        $('liveSumValue').textContent = formatNumber(liveInitial.merged.sum, 4);
+        $('polarsSumValue').textContent = formatNumber(polarsInitial.merged.sum, 4);
+
+        const mutation = mutateLabel1Value(delta);
+        $('expectedDeltaValue').textContent = formatNumber(mutation.expectedDelta, 4);
+        log(`Mutated live bank at global row ${formatNumber(mutation.globalIndex, 0)}: ${mutation.before} -> ${mutation.after}.`);
+
+        const liveMutated = await runWorkerPhase(assignments, 'live');
+        const polarsMutated = await runWorkerPhase(assignments, 'polars');
+
+        $('mutatedLiveSumValue').textContent = formatNumber(liveMutated.merged.sum, 4);
+        $('mutatedPolarsSumValue').textContent = formatNumber(polarsMutated.merged.sum, 4);
+        const liveDelta = liveMutated.merged.sum - liveInitial.merged.sum;
+        const polarsDelta = polarsMutated.merged.sum - polarsInitial.merged.sum;
+        $('liveDeltaValue').textContent = formatNumber(liveDelta, 4);
+        $('polarsDeltaValue').textContent = formatNumber(polarsDelta, 4);
+
+        const initialLiveSuccess = Math.abs(liveInitial.merged.sum - reference.sum) <= 1e-6 * Math.max(1, Math.abs(reference.sum)) && liveInitial.merged.label1Count === reference.label1Count && liveInitial.merged.partition0Count === reference.partition0Count && liveInitial.merged.partition1Count === reference.partition1Count;
+        const initialPolarsSuccess = Math.abs(polarsInitial.merged.sum - reference.sum) <= 1e-6 * Math.max(1, Math.abs(reference.sum)) && polarsInitial.merged.label1Count === reference.label1Count && polarsInitial.merged.partition0Count === reference.partition0Count && polarsInitial.merged.partition1Count === reference.partition1Count;
+        const mutatedLiveSuccess = Math.abs(liveDelta - mutation.expectedDelta) <= 1e-9 * Math.max(1, Math.abs(mutation.expectedDelta));
+        const mutatedPolarsSuccess = Math.abs(polarsDelta - mutation.expectedDelta) <= 1e-9 * Math.max(1, Math.abs(mutation.expectedDelta));
+        const success = initialLiveSuccess && initialPolarsSuccess && mutatedLiveSuccess && mutatedPolarsSuccess;
+
+        resultEl.textContent = JSON.stringify({
+          totalRows,
+          partitionRows,
+          workerCount: assignments.length,
+          shardMiB,
+          shardCount: memories.length,
+          bankSizeBytes: totalBankBytes(),
+          usedBytes,
+          partitionCount: manifest.partitions.length,
+          initialLive: { wallMs: liveInitial.wallMs, merged: liveInitial.merged, workers: liveInitial.results, success: initialLiveSuccess },
+          initialPolars: { wallMs: polarsInitial.wallMs, merged: polarsInitial.merged, workers: polarsInitial.results, success: initialPolarsSuccess },
+          mutation,
+          mutatedLive: { wallMs: liveMutated.wallMs, merged: liveMutated.merged, delta: liveDelta, success: mutatedLiveSuccess },
+          mutatedPolars: { wallMs: polarsMutated.wallMs, merged: polarsMutated.merged, delta: polarsDelta, success: mutatedPolarsSuccess },
+          jsReference: reference,
+          success,
+        }, null, 2);
+
+        if (success) {
+          setStatus('good', `Live-view + Polars bank proof passed for ${formatNumber(totalRows, 0)} rows across ${assignments.length} workers.`);
+        } else {
+          setStatus('bad', 'Live-view + Polars bank proof mismatch.');
+        }
+
+        log(`Live wall=${liveInitial.wallMs.toFixed(1)} ms, Polars wall=${polarsInitial.wallMs.toFixed(1)} ms, live delta=${liveDelta}, Polars delta=${polarsDelta}, success=${success}`);
+      } catch (error) {
+        setStatus('bad', `Live-view + Polars bank proof failed: ${error.message || error}`);
+        log(`FAIL: ${error.message || error}`);
+      } finally {
+        runBtn.disabled = false;
+        updateHeapMetric();
+      }
+    }
+
+    runBtn.addEventListener('click', () => {
+      runProof();
+    });
+
+    releaseBtn.addEventListener('click', () => {
+      releaseAll();
+    });
+
+    manifestEl.textContent = 'No manifest yet.';
+    resultEl.textContent = 'No result yet.';
+    updateHeapMetric();
+    log('Ready. This page proves that fresh Polars workers can consume the real shared-bank manifest and track shared-bank mutations exactly.');
+  </script>
+</body>
+</html>

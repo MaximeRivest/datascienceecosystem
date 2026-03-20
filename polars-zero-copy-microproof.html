@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Polars Zero-Copy Micro-Proof</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #121a33;
+      --panel-2: #0f1730;
+      --text: #e7ecff;
+      --muted: #a6b0d5;
+      --good: #66e3a4;
+      --warn: #ffd166;
+      --bad: #ff7b7b;
+      --border: #26345f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #0a0f1d, #0b1020 40%, #0d1327);
+      color: var(--text);
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 32px 20px 48px; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { margin: 8px 0; color: var(--muted); }
+    .card {
+      background: rgba(18, 26, 51, 0.9);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      margin-top: 18px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.22);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    input, button {
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+    }
+    button {
+      border: 0;
+      background: linear-gradient(180deg, #1c6fff, #1758cc);
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .secondary { background: #1a2447; border: 1px solid var(--border); }
+    .status {
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #101833;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
+    .status.good { border-color: rgba(102, 227, 164, .35); color: var(--good); }
+    .status.warn { border-color: rgba(255, 209, 102, .35); color: var(--warn); }
+    .status.bad { border-color: rgba(255, 123, 123, .35); color: var(--bad); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .metric {
+      background: #0e1630;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .metric .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .metric .value { margin-top: 8px; font-size: 22px; font-weight: 800; }
+    pre {
+      margin: 0;
+      background: #0b1228;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+      max-height: 360px;
+      color: #cfe0ff;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .small { font-size: 12px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Polars Zero-Copy Micro-Proof</h1>
+    <p>
+      This page compares two Polars ingestion modes for the same typed columns: a normal copy-based bridge and a zero-copy micro-proof where the data is written directly into Polars-owned Wasm memory and transferred to Polars by ownership, not by copy.
+    </p>
+
+    <div id="status" class="status warn">Polars wasm not loaded yet.</div>
+
+    <div class="card">
+      <strong>Test setup</strong>
+      <div class="grid">
+        <label>
+          Rows
+          <input id="rowsInput" type="number" min="1" step="1000000" value="10000000" />
+        </label>
+      </div>
+      <div class="row">
+        <button id="loadBtn">1. Load Polars wasm</button>
+        <button id="runBtn" disabled>2. Run copy vs zero-copy proof</button>
+      </div>
+      <p class="small">
+        This is not shard-bank integration. It is a micro-proof for a Polars-friendly arena layout where Polars can take ownership of already-populated typed buffers.
+      </p>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="label">Wasm size</div><div id="wasmSizeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Load/init time</div><div id="loadTimeValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Copy path fill</div><div id="copyFillValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Copy path Polars</div><div id="copyPolarsValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Zero-copy fill</div><div id="zcFillValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Zero-copy Polars</div><div id="zcPolarsValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Copy sum</div><div id="copySumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Zero-copy sum</div><div id="zcSumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">JS sum</div><div id="jsSumValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Copy label1</div><div id="copyCountValue" class="value">-</div></div>
+      <div class="metric"><div class="label">Zero-copy label1</div><div id="zcCountValue" class="value">-</div></div>
+    </div>
+
+    <div class="card">
+      <strong>Result</strong>
+      <pre id="result"></pre>
+    </div>
+
+    <div class="card">
+      <strong>Log</strong>
+      <pre id="log"></pre>
+    </div>
+  </div>
+
+  <script type="module">
+    import initPolars from './polars-web/polars_spike.js';
+
+    const $ = (id) => document.getElementById(id);
+    const statusEl = $('status');
+    const logEl = $('log');
+    const resultEl = $('result');
+    const loadBtn = $('loadBtn');
+    const runBtn = $('runBtn');
+    const rowsInput = $('rowsInput');
+
+    let polars = null;
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      logEl.textContent += `[${time}] ${message}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setStatus(kind, text) {
+      statusEl.className = `status ${kind}`;
+      statusEl.textContent = text;
+    }
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes)) return '-';
+      const units = ['B', 'KiB', 'MiB', 'GiB'];
+      let value = bytes;
+      let index = 0;
+      while (value >= 1024 && index < units.length - 1) {
+        value /= 1024;
+        index++;
+      }
+      return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[index]}`;
+    }
+
+    function formatNumber(value, digits = 2) {
+      if (!Number.isFinite(value)) return '-';
+      return new Intl.NumberFormat(undefined, {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: digits,
+      }).format(value);
+    }
+
+    function jsReference(rows) {
+      let sum = 0;
+      let label1Count = 0;
+      let partition0Count = 0;
+      let partition1Count = 0;
+      for (let i = 0; i < rows; i++) {
+        const value = ((i % 1000) * 0.5) - 100.0;
+        const label = (i % 3 === 0 || i % 5 === 0) ? 1 : 0;
+        const partition = i % 8;
+        if (partition === 0) partition0Count++;
+        else if (partition === 1) partition1Count++;
+        if (label === 1) {
+          sum += value;
+          label1Count++;
+        }
+      }
+      return { sum, label1Count, partition0Count, partition1Count };
+    }
+
+    async function loadPolars() {
+      setStatus('warn', 'Loading Polars wasm...');
+      const startedAt = performance.now();
+      const response = await fetch('./polars-web/polars_spike_bg.wasm');
+      const wasmBytes = await response.arrayBuffer();
+      $('wasmSizeValue').textContent = formatBytes(wasmBytes.byteLength);
+      polars = await initPolars(wasmBytes);
+      const endedAt = performance.now();
+      $('loadTimeValue').textContent = `${(endedAt - startedAt).toFixed(1)} ms`;
+      setStatus('good', 'Polars wasm loaded successfully.');
+      runBtn.disabled = false;
+      log(`Loaded Polars wasm (${formatBytes(wasmBytes.byteLength)}) in ${(endedAt - startedAt).toFixed(1)} ms.`);
+    }
+
+    function runProof() {
+      const rows = Math.trunc(Number(rowsInput.value));
+      if (!Number.isFinite(rows) || rows <= 0) {
+        setStatus('bad', 'Invalid row count.');
+        return;
+      }
+      const reference = jsReference(rows);
+      $('jsSumValue').textContent = formatNumber(reference.sum, 4);
+
+      const copyFillStarted = performance.now();
+      // Baseline copy path: Polars generates/owns its own vectors internally.
+      const copyFillEnded = performance.now();
+
+      const copyPolarsStarted = performance.now();
+      const copySum = polars.polars_generated_sum(rows);
+      const copyPolarsEnded = performance.now();
+      const copyLabel1 = polars.polars_last_label1_count();
+      const copyPartition0 = polars.polars_last_partition0_count();
+      const copyPartition1 = polars.polars_last_partition1_count();
+
+      const f2Start = performance.now();
+      const featurePtr = polars.polars_alloc_f64_buffer(rows);
+      const labelPtr = polars.polars_alloc_i32_buffer(rows);
+      const partitionPtr = polars.polars_alloc_i32_buffer(rows);
+      const featureView = new Float64Array(polars.memory.buffer, featurePtr, rows);
+      const labelView = new Int32Array(polars.memory.buffer, labelPtr, rows);
+      const partitionView = new Int32Array(polars.memory.buffer, partitionPtr, rows);
+      for (let i = 0; i < rows; i++) {
+        featureView[i] = ((i % 1000) * 0.5) - 100.0;
+        labelView[i] = (i % 3 === 0 || i % 5 === 0) ? 1 : 0;
+        partitionView[i] = i % 8;
+      }
+      const f2End = performance.now();
+
+      const zcStarted = performance.now();
+      const zcSum = polars.polars_from_owned_buffers(featurePtr, labelPtr, partitionPtr, rows);
+      const zcPolarsEnded = performance.now();
+      const zcLabel1 = polars.polars_last_label1_count();
+      const zcPartition0 = polars.polars_last_partition0_count();
+      const zcPartition1 = polars.polars_last_partition1_count();
+
+      $('copyFillValue').textContent = `${(copyFillEnded - copyFillStarted).toFixed(1)} ms`;
+      $('copyPolarsValue').textContent = `${(copyPolarsEnded - copyPolarsStarted).toFixed(1)} ms`;
+      $('zcFillValue').textContent = `${(f2End - f2Start).toFixed(1)} ms`;
+      $('zcPolarsValue').textContent = `${(zcPolarsEnded - zcStarted).toFixed(1)} ms`;
+      $('copySumValue').textContent = formatNumber(copySum, 4);
+      $('zcSumValue').textContent = formatNumber(zcSum, 4);
+      $('copyCountValue').textContent = formatNumber(copyLabel1, 0);
+      $('zcCountValue').textContent = formatNumber(zcLabel1, 0);
+
+      const copySuccess =
+        Math.abs(copySum - reference.sum) <= 1e-6 * Math.max(1, Math.abs(reference.sum)) &&
+        copyLabel1 === reference.label1Count &&
+        copyPartition0 === reference.partition0Count &&
+        copyPartition1 === reference.partition1Count;
+
+      const zeroCopySuccess =
+        Math.abs(zcSum - reference.sum) <= 1e-6 * Math.max(1, Math.abs(reference.sum)) &&
+        zcLabel1 === reference.label1Count &&
+        zcPartition0 === reference.partition0Count &&
+        zcPartition1 === reference.partition1Count;
+
+      const success = copySuccess && zeroCopySuccess;
+
+      resultEl.textContent = JSON.stringify({
+        rows,
+        copyPath: {
+          generationMs: copyFillEnded - copyFillStarted,
+          polarsComputeMs: copyPolarsEnded - copyPolarsStarted,
+          sum: copySum,
+          label1Count: copyLabel1,
+          partition0Count: copyPartition0,
+          partition1Count: copyPartition1,
+        },
+        zeroCopyPath: {
+          fillIntoPolarsMemoryMs: f2End - f2Start,
+          polarsComputeMs: zcPolarsEnded - zcStarted,
+          sum: zcSum,
+          label1Count: zcLabel1,
+          partition0Count: zcPartition0,
+          partition1Count: zcPartition1,
+        },
+        jsReference: reference,
+        success,
+      }, null, 2);
+
+      if (success) {
+        setStatus('good', `Zero-copy micro-proof passed for ${rows.toLocaleString()} rows.`);
+      } else {
+        setStatus('bad', 'Zero-copy micro-proof mismatch.');
+      }
+      log(`Zero-copy micro-proof: rows=${rows}, copyPolars=${(copyPolarsEnded - copyPolarsStarted).toFixed(1)} ms, zeroCopyFill=${(f2End - f2Start).toFixed(1)} ms, zeroCopyPolars=${(zcPolarsEnded - zcStarted).toFixed(1)} ms, success=${success}`);
+    }
+
+    loadBtn.addEventListener('click', () => {
+      loadPolars().catch((error) => {
+        setStatus('bad', `Load failed: ${error.message}`);
+        log(`Load failed: ${error.message}`);
+      });
+    });
+
+    runBtn.addEventListener('click', () => {
+      try {
+        runProof();
+      } catch (error) {
+        setStatus('bad', `Proof failed: ${error.message}`);
+        log(`Proof failed: ${error.message}`);
+      }
+    });
+
+    resultEl.textContent = 'No result yet.';
+    log('Ready. Load Polars wasm, then run the zero-copy micro-proof.');
+  </script>
+</body>
+</html>
