@@ -1,0 +1,564 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGPU ViT Inference — C. elegans Classifier</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #121a33;
+      --panel-2: #0f1730;
+      --text: #e7ecff;
+      --muted: #a6b0d5;
+      --good: #66e3a4;
+      --warn: #ffd166;
+      --bad: #ff7b7b;
+      --border: #26345f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #0a0f1d, #0b1020 40%, #0d1327);
+      color: var(--text);
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 32px 20px 48px; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { margin: 8px 0; color: var(--muted); }
+    .card {
+      background: rgba(18, 26, 51, 0.9);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      margin-top: 18px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.22);
+    }
+    button {
+      border-radius: 10px;
+      border: 0;
+      background: linear-gradient(180deg, #1c6fff, #1758cc);
+      color: var(--text);
+      padding: 10px 16px;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .secondary { background: #1a2447; border: 1px solid var(--border); }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    .status {
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #101833;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
+    .status.good { border-color: rgba(102, 227, 164, 0.35); color: var(--good); }
+    .status.warn { border-color: rgba(255, 209, 102, 0.35); color: var(--warn); }
+    .status.bad { border-color: rgba(255, 123, 123, 0.35); color: var(--bad); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .metric {
+      background: #0e1630;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .metric .label {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .metric .value {
+      margin-top: 8px;
+      font-size: 22px;
+      font-weight: 800;
+    }
+    .metric .value.small-value { font-size: 16px; }
+    pre {
+      margin: 0;
+      background: #0b1228;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+      max-height: 400px;
+      color: #cfe0ff;
+    }
+    .small { font-size: 12px; color: var(--muted); }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .drop-zone {
+      border: 2px dashed var(--border);
+      border-radius: 16px;
+      padding: 40px;
+      text-align: center;
+      margin-top: 16px;
+      cursor: pointer;
+      transition: border-color 0.2s;
+    }
+    .drop-zone:hover, .drop-zone.dragover { border-color: #1c6fff; }
+    .drop-zone img {
+      max-width: 300px;
+      max-height: 300px;
+      border-radius: 12px;
+      margin-top: 12px;
+    }
+    .result-bar {
+      height: 32px;
+      border-radius: 8px;
+      margin-top: 8px;
+      display: flex;
+      align-items: center;
+      padding: 0 12px;
+      font-weight: 700;
+      font-size: 14px;
+    }
+    .progress {
+      width: 100%;
+      height: 8px;
+      background: var(--panel-2);
+      border-radius: 4px;
+      margin-top: 8px;
+      overflow: hidden;
+    }
+    .progress-bar {
+      height: 100%;
+      background: linear-gradient(90deg, #1c6fff, #66e3a4);
+      border-radius: 4px;
+      transition: width 0.3s;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>WebGPU ViT Inference</h1>
+    <p>
+      Runs <code>lillyguisnet/celegans-classifier-vit-h-14-finetuned</code> (632M params, ViT-H/14)
+      directly in the browser via ONNX Runtime Web + WebGPU.
+      Model weights are stored in a user-selected folder for reuse across visits.
+    </p>
+
+    <div id="status" class="status warn">Initializing...</div>
+
+    <!-- Step 1: Model storage (OPFS — no file picker needed) -->
+    <div class="card">
+      <strong>1. Model Storage</strong>
+      <p class="small">
+        Model weights (~1.2 GiB) are cached in the browser's internal storage (OPFS).
+        On revisit, the model loads from cache — no re-download needed.
+      </p>
+      <div class="row">
+        <button id="loadModelBtn">Load / Download model → WebGPU</button>
+        <button id="clearCacheBtn" class="secondary">Clear cached model</button>
+      </div>
+      <div id="folderStatus" class="small" style="margin-top:8px">Checking cache...</div>
+      <div class="progress" id="downloadProgress" style="display:none">
+        <div class="progress-bar" id="downloadBar" style="width:0%"></div>
+      </div>
+    </div>
+
+    <!-- Step 2: Inference -->
+    <div class="card">
+      <strong>2. Classify Image</strong>
+      <div class="row">
+        <button id="fakeWormBtn" disabled>Test with random tensor (no image needed)</button>
+      </div>
+      <div class="drop-zone" id="dropZone">
+        <p>Or drop a real image here / click to select</p>
+        <input type="file" id="fileInput" accept="image/*" style="display:none" />
+        <img id="previewImg" style="display:none" />
+      </div>
+    </div>
+
+    <!-- Results -->
+    <div class="metrics">
+      <div class="metric"><div class="label">Model</div><div id="modelName" class="value small-value">—</div></div>
+      <div class="metric"><div class="label">Backend</div><div id="backend" class="value small-value">—</div></div>
+      <div class="metric"><div class="label">Model load time</div><div id="loadTime" class="value">—</div></div>
+      <div class="metric"><div class="label">Inference time</div><div id="inferTime" class="value">—</div></div>
+      <div class="metric"><div class="label">Prediction</div><div id="prediction" class="value small-value">—</div></div>
+      <div class="metric"><div class="label">Confidence</div><div id="confidence" class="value">—</div></div>
+    </div>
+
+    <!-- Log -->
+    <div class="card">
+      <strong>Log</strong>
+      <pre id="log"></pre>
+    </div>
+  </div>
+
+  <!-- ONNX Runtime Web -->
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.all.min.js"></script>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const logEl = $("log");
+
+    const MODEL_FILENAME = "model_fp16.onnx";
+    const MODEL_URL = `/models/celegans-vit-h14/${MODEL_FILENAME}`;
+    const LABELS = { 0: "notworm", 1: "worm_any" };
+    const IMAGE_SIZE = 518;
+    const IMAGE_MEAN = [0.485, 0.456, 0.406];
+    const IMAGE_STD = [0.229, 0.224, 0.225];
+
+    let session = null;
+
+    // float32 → float16 (IEEE 754 half precision)
+    const f32Buf = new Float32Array(1);
+    const u32Buf = new Uint32Array(f32Buf.buffer);
+    function float32ToFloat16(val) {
+      f32Buf[0] = val;
+      const f = u32Buf[0];
+      const sign = (f >> 16) & 0x8000;
+      const exp = ((f >> 23) & 0xff) - 127 + 15;
+      const frac = (f >> 13) & 0x03ff;
+      if (exp <= 0) return sign;
+      if (exp >= 31) return sign | 0x7c00;
+      return sign | (exp << 10) | frac;
+    }
+
+    function log(msg) {
+      const t = new Date().toLocaleTimeString();
+      logEl.textContent += `[${t}] ${msg}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setStatus(text, cls = "warn") {
+      $("status").textContent = text;
+      $("status").className = `status ${cls}`;
+    }
+
+    // ─── OPFS helpers ───
+    async function getOPFSRoot() {
+      return await navigator.storage.getDirectory();
+    }
+
+    async function getCachedModel() {
+      try {
+        const root = await getOPFSRoot();
+        const fileHandle = await root.getFileHandle(MODEL_FILENAME);
+        const file = await fileHandle.getFile();
+        if (file.size < 1000) return null; // corrupt/empty
+        return file;
+      } catch {
+        return null;
+      }
+    }
+
+    async function downloadAndCacheModel() {
+      $("downloadProgress").style.display = "block";
+
+      log(`Downloading model from server...`);
+      setStatus("Downloading model... (~1.2 GiB)", "warn");
+
+      const response = await fetch(MODEL_URL);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+      const contentLength = +response.headers.get("Content-Length") || 0;
+      const reader = response.body.getReader();
+      const chunks = [];
+      let received = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        if (contentLength > 0) {
+          const pct = ((received / contentLength) * 100).toFixed(1);
+          $("downloadBar").style.width = `${pct}%`;
+          if (received % (50 * 1024 * 1024) < value.length) {
+            log(`  ${(received / 1e6).toFixed(0)} / ${(contentLength / 1e6).toFixed(0)} MB (${pct}%)`);
+          }
+        }
+      }
+
+      log(`Download complete: ${(received / 1e9).toFixed(2)} GB`);
+
+      // Write to OPFS
+      log("Caching model in browser storage (OPFS)...");
+      const root = await getOPFSRoot();
+      const fileHandle = await root.getFileHandle(MODEL_FILENAME, { create: true });
+      const writable = await fileHandle.createWritable();
+      for (const chunk of chunks) {
+        await writable.write(chunk);
+      }
+      await writable.close();
+
+      $("downloadBar").style.width = "100%";
+      log("Model cached ✓");
+
+      return await (await root.getFileHandle(MODEL_FILENAME)).getFile();
+    }
+
+    // ─── Clear cache ───
+    $("clearCacheBtn").addEventListener("click", async () => {
+      try {
+        const root = await getOPFSRoot();
+        await root.removeEntry(MODEL_FILENAME);
+        log("Cached model deleted.");
+        $("folderStatus").textContent = "Cache cleared. Click 'Load' to re-download.";
+        $("loadModelBtn").disabled = false;
+        $("loadModelBtn").textContent = "Load / Download model → WebGPU";
+      } catch (e) {
+        log(`Clear cache: ${e.message}`);
+      }
+    });
+
+    // ─── Load model (download if needed, then init ONNX) ───
+    $("loadModelBtn").addEventListener("click", async () => {
+      $("loadModelBtn").disabled = true;
+
+      try {
+        // Check OPFS cache first
+        let file = await getCachedModel();
+
+        if (file) {
+          log(`Model found in browser cache! Size: ${(file.size / 1e9).toFixed(2)} GB`);
+          $("folderStatus").textContent = `Cached: ${MODEL_FILENAME} (${(file.size / 1e6).toFixed(0)} MB)`;
+        } else {
+          log("Model not in cache. Downloading...");
+          file = await downloadAndCacheModel();
+        }
+
+        // Load into ONNX Runtime
+        setStatus("Loading model into WebGPU...", "warn");
+        log("Reading model into memory...");
+        const arrayBuffer = await file.arrayBuffer();
+        log(`Model read: ${(arrayBuffer.byteLength / 1e9).toFixed(2)} GB`);
+
+        let executionProvider = "webgpu";
+        log(`Initializing ONNX Runtime with ${executionProvider} backend...`);
+
+        const t0 = performance.now();
+        try {
+          session = await ort.InferenceSession.create(arrayBuffer, {
+            executionProviders: [executionProvider],
+            graphOptimizationLevel: "all",
+          });
+        } catch (e) {
+          log(`WebGPU backend failed: ${e.message}`);
+          log("Falling back to WASM backend...");
+          executionProvider = "wasm";
+          session = await ort.InferenceSession.create(arrayBuffer, {
+            executionProviders: ["wasm"],
+            graphOptimizationLevel: "all",
+          });
+        }
+        const loadMs = performance.now() - t0;
+
+        log(`Model loaded on ${executionProvider} in ${loadMs.toFixed(0)} ms`);
+        log(`Input names: ${session.inputNames}`);
+        log(`Output names: ${session.outputNames}`);
+
+        $("modelName").textContent = "ViT-H/14 (632M)";
+        $("backend").textContent = executionProvider;
+        $("loadTime").textContent = `${(loadMs / 1000).toFixed(1)} s`;
+        $("loadModelBtn").textContent = "Model loaded ✓";
+        $("fakeWormBtn").disabled = false;
+
+        setStatus(`Model loaded on ${executionProvider}. Drop an image or click 'Test with random tensor'.`, "good");
+
+      } catch (e) {
+        log(`Failed: ${e.message}`);
+        setStatus(`Failed: ${e.message}`, "bad");
+        $("loadModelBtn").disabled = false;
+      }
+    });
+
+    // ─── Image preprocessing ───
+    function preprocessImage(imgElement) {
+      const canvas = document.createElement("canvas");
+      canvas.width = IMAGE_SIZE;
+      canvas.height = IMAGE_SIZE;
+      const ctx = canvas.getContext("2d");
+
+      // Resize with center crop
+      const scale = Math.max(IMAGE_SIZE / imgElement.naturalWidth, IMAGE_SIZE / imgElement.naturalHeight);
+      const sw = IMAGE_SIZE / scale;
+      const sh = IMAGE_SIZE / scale;
+      const sx = (imgElement.naturalWidth - sw) / 2;
+      const sy = (imgElement.naturalHeight - sh) / 2;
+
+      ctx.drawImage(imgElement, sx, sy, sw, sh, 0, 0, IMAGE_SIZE, IMAGE_SIZE);
+
+      const imageData = ctx.getImageData(0, 0, IMAGE_SIZE, IMAGE_SIZE);
+      const { data } = imageData;
+
+      // Convert to CHW float16 with normalization
+      const count = 3 * IMAGE_SIZE * IMAGE_SIZE;
+      const f16Data = new Uint16Array(count);
+      for (let y = 0; y < IMAGE_SIZE; y++) {
+        for (let x = 0; x < IMAGE_SIZE; x++) {
+          const srcIdx = (y * IMAGE_SIZE + x) * 4;
+          const dstIdx = y * IMAGE_SIZE + x;
+          f16Data[0 * IMAGE_SIZE * IMAGE_SIZE + dstIdx] = float32ToFloat16((data[srcIdx] / 255 - IMAGE_MEAN[0]) / IMAGE_STD[0]);
+          f16Data[1 * IMAGE_SIZE * IMAGE_SIZE + dstIdx] = float32ToFloat16((data[srcIdx + 1] / 255 - IMAGE_MEAN[1]) / IMAGE_STD[1]);
+          f16Data[2 * IMAGE_SIZE * IMAGE_SIZE + dstIdx] = float32ToFloat16((data[srcIdx + 2] / 255 - IMAGE_MEAN[2]) / IMAGE_STD[2]);
+        }
+      }
+
+      return f16Data;
+    }
+
+    // ─── Inference ───
+    async function runInference(imgElement) {
+      if (!session) {
+        log("Model not loaded yet!");
+        return;
+      }
+
+      log("Preprocessing image...");
+      const pixelValues = preprocessImage(imgElement);
+
+      log("Running inference...");
+      const tensor = new ort.Tensor("float16", pixelValues, [1, 3, IMAGE_SIZE, IMAGE_SIZE]);
+      const feeds = { pixel_values: tensor };
+
+      // Warmup run
+      log("  warmup run...");
+      await session.run(feeds);
+
+      // Timed run
+      const t0 = performance.now();
+      const results = await session.run(feeds);
+      const inferMs = performance.now() - t0;
+
+      const logits = Float32Array.from(results.logits.data);
+      log(`Logits: [${Array.from(logits).map(v => v.toFixed(4)).join(", ")}]`);
+
+      // Softmax
+      const maxLogit = Math.max(...logits);
+      const exps = Array.from(logits).map(v => Math.exp(v - maxLogit));
+      const sumExps = exps.reduce((a, b) => a + b, 0);
+      const probs = exps.map(e => e / sumExps);
+
+      const predIdx = probs[0] > probs[1] ? 0 : 1;
+      const predLabel = LABELS[predIdx];
+      const predConf = probs[predIdx];
+
+      log(`Prediction: ${predLabel} (${(predConf * 100).toFixed(1)}%)`);
+      log(`Inference time: ${inferMs.toFixed(1)} ms`);
+      log(`  notworm: ${(probs[0] * 100).toFixed(1)}%`);
+      log(`  worm_any: ${(probs[1] * 100).toFixed(1)}%`);
+
+      $("inferTime").textContent = `${inferMs.toFixed(0)} ms`;
+      $("prediction").textContent = predLabel;
+      $("confidence").textContent = `${(predConf * 100).toFixed(1)}%`;
+    }
+
+    // ─── Fake tensor test ───
+    $("fakeWormBtn").addEventListener("click", async () => {
+      if (!session) return;
+
+      log("Generating random 518×518 float16 tensor...");
+      const count = 3 * IMAGE_SIZE * IMAGE_SIZE;
+      const f32 = new Float32Array(count);
+      for (let i = 0; i < count; i++) {
+        f32[i] = (Math.random() - 0.5) * 2;
+      }
+      const f16 = new Uint16Array(count);
+      for (let i = 0; i < count; i++) {
+        f16[i] = float32ToFloat16(f32[i]);
+      }
+
+      const tensor = new ort.Tensor("float16", f16, [1, 3, IMAGE_SIZE, IMAGE_SIZE]);
+      const feeds = { pixel_values: tensor };
+
+      // Warmup
+      log("Warmup run...");
+      await session.run(feeds);
+
+      // Timed runs
+      const times = [];
+      const N = 5;
+      log(`Running ${N} timed inferences...`);
+      for (let i = 0; i < N; i++) {
+        const t0 = performance.now();
+        const results = await session.run(feeds);
+        const ms = performance.now() - t0;
+        times.push(ms);
+
+        if (i === 0) {
+          const logits = Float32Array.from(results.logits.data);
+          const maxLogit = Math.max(...logits);
+          const exps = Array.from(logits).map(v => Math.exp(v - maxLogit));
+          const sumExps = exps.reduce((a, b) => a + b, 0);
+          const probs = exps.map(e => e / sumExps);
+          const predIdx = probs[0] > probs[1] ? 0 : 1;
+          log(`  Logits: [${Array.from(logits).map(v => v.toFixed(4)).join(", ")}]`);
+          log(`  Prediction: ${LABELS[predIdx]} (${(probs[predIdx] * 100).toFixed(1)}%) — random input, result is meaningless`);
+          $("prediction").textContent = `${LABELS[predIdx]} (random)`;
+          $("confidence").textContent = `${(probs[predIdx] * 100).toFixed(1)}%`;
+        }
+        log(`  Run ${i + 1}: ${ms.toFixed(1)} ms`);
+      }
+
+      const avg = times.reduce((a, b) => a + b, 0) / times.length;
+      const min = Math.min(...times);
+      const max = Math.max(...times);
+      log(`\nResults over ${N} runs:`);
+      log(`  avg: ${avg.toFixed(1)} ms`);
+      log(`  min: ${min.toFixed(1)} ms`);
+      log(`  max: ${max.toFixed(1)} ms`);
+      $("inferTime").textContent = `${avg.toFixed(0)} ms avg`;
+    });
+
+    // ─── Drop zone ───
+    const dropZone = $("dropZone");
+    const fileInput = $("fileInput");
+    const previewImg = $("previewImg");
+
+    dropZone.addEventListener("click", () => fileInput.click());
+    dropZone.addEventListener("dragover", (e) => { e.preventDefault(); dropZone.classList.add("dragover"); });
+    dropZone.addEventListener("dragleave", () => dropZone.classList.remove("dragover"));
+    dropZone.addEventListener("drop", (e) => {
+      e.preventDefault();
+      dropZone.classList.remove("dragover");
+      if (e.dataTransfer.files.length > 0) handleFile(e.dataTransfer.files[0]);
+    });
+    fileInput.addEventListener("change", () => {
+      if (fileInput.files.length > 0) handleFile(fileInput.files[0]);
+    });
+
+    function handleFile(file) {
+      if (!file.type.startsWith("image/")) {
+        log("Not an image file.");
+        return;
+      }
+      const url = URL.createObjectURL(file);
+      previewImg.src = url;
+      previewImg.style.display = "block";
+      previewImg.onload = () => {
+        log(`Image loaded: ${previewImg.naturalWidth}×${previewImg.naturalHeight}`);
+        runInference(previewImg);
+      };
+    }
+
+    // ─── Init: check cache on load ───
+    (async () => {
+      const file = await getCachedModel();
+      if (file) {
+        log(`Model found in browser cache: ${(file.size / 1e6).toFixed(0)} MB`);
+        $("folderStatus").textContent = `Cached: ${MODEL_FILENAME} (${(file.size / 1e6).toFixed(0)} MB)`;
+        setStatus("Model cached. Click 'Load' to initialize on WebGPU.", "good");
+      } else {
+        log("No cached model. Click 'Load' to download and initialize.");
+        $("folderStatus").textContent = "No cached model — will download on first load (~1.2 GiB)";
+        setStatus("Ready. Click 'Load' to download model and run on WebGPU.", "warn");
+      }
+      if (!navigator.gpu) {
+        log("WebGPU not detected. ONNX Runtime will fall back to WASM backend.");
+      }
+    })();
+  </script>
+</body>
+</html>

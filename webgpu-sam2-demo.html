@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGPU SAM2 — Click to Segment</title>
+  <style>
+    :root{color-scheme:dark;--text:#e7ecff;--muted:#a6b0d5;--good:#66e3a4;--warn:#ffd166;--bad:#ff7b7b;--border:#26345f}
+    *{box-sizing:border-box}body{margin:0;font:14px/1.45 system-ui,sans-serif;background:linear-gradient(180deg,#0a0f1d,#0b1020 40%,#0d1327);color:var(--text)}
+    .wrap{max-width:1200px;margin:0 auto;padding:24px 20px 48px}h1{margin:0 0 6px;font-size:26px}p{margin:6px 0;color:var(--muted)}
+    .card{background:rgba(18,26,51,.9);border:1px solid var(--border);border-radius:16px;padding:16px;margin-top:14px}
+    button{border-radius:10px;border:0;background:linear-gradient(180deg,#1c6fff,#1758cc);color:var(--text);padding:10px 16px;font:inherit;font-weight:700;cursor:pointer}
+    button:disabled{opacity:.6;cursor:not-allowed}.secondary{background:#1a2447;border:1px solid var(--border)}.danger{background:linear-gradient(180deg,#c14444,#9e2f2f)}
+    .row{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+    .status{padding:10px 14px;border-radius:12px;border:1px solid var(--border);background:#101833;margin-top:10px;white-space:pre-wrap}
+    .status.good{border-color:rgba(102,227,164,.35);color:var(--good)}.status.warn{border-color:rgba(255,209,102,.35);color:var(--warn)}.status.bad{border-color:rgba(255,123,123,.35);color:var(--bad)}
+    .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-top:12px}
+    .metric{background:#0e1630;border:1px solid var(--border);border-radius:12px;padding:10px}.metric .label{font-size:11px;color:var(--muted);text-transform:uppercase}
+    .metric .value{margin-top:6px;font-size:18px;font-weight:800}.metric .value.sm{font-size:14px}
+    pre{margin:0;background:#0b1228;border:1px solid var(--border);border-radius:12px;padding:12px;overflow:auto;max-height:300px;color:#cfe0ff;font-size:12px}
+    .small{font-size:12px;color:var(--muted)}
+    .progress{width:100%;height:8px;background:#0f1730;border-radius:4px;margin-top:8px;overflow:hidden}.progress-bar{height:100%;background:linear-gradient(90deg,#1c6fff,#66e3a4);border-radius:4px;transition:width .3s}
+    .canvas-wrap{position:relative;margin-top:12px;display:inline-block;border:2px solid var(--border);border-radius:12px;overflow:hidden;cursor:crosshair}.canvas-wrap canvas{display:block}
+    .pt{position:absolute;width:16px;height:16px;border:3px solid #ff4444;border-radius:50%;background:rgba(255,68,68,.4);transform:translate(-50%,-50%);pointer-events:none}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>WebGPU SAM2 — Click to Segment</h1>
+  <p>SAM 2.1 Hiera Large. Vision encoder on WebGPU, prompt encoding in JS, mask decoder on WebGPU. Real inference on YOUR image.</p>
+  <div id="status" class="status warn">Initializing...</div>
+  <div class="card">
+    <strong>Models</strong><p class="small">Vision+neck (~853 MiB) + decoder (~16 MiB) + prompt params (~1 KB). Cached in OPFS.</p>
+    <div class="row"><button id="loadBtn">Load → WebGPU</button><button id="clearBtn" class="secondary">Clear cache</button></div>
+    <div id="cacheInfo" class="small" style="margin-top:6px">Checking...</div>
+    <div class="progress" id="dlProg" style="display:none"><div class="progress-bar" id="dlBar" style="width:0%"></div></div>
+  </div>
+  <div class="card">
+    <strong>Image</strong>
+    <div class="row"><button id="dogBtn" disabled>Test image (dog)</button><button id="pickBtn" disabled class="secondary">Upload</button><button id="clrBtn" disabled class="danger">Clear</button><input type="file" id="imgF" accept="image/*" style="display:none"/></div>
+    <div class="canvas-wrap" id="cWrap" style="display:none"><canvas id="cv"></canvas></div>
+    <p class="small" id="hint" style="display:none">Click on the image to segment.</p>
+  </div>
+  <div class="metrics">
+    <div class="metric"><div class="label">Backend</div><div id="mBk" class="value sm">—</div></div>
+    <div class="metric"><div class="label">Encoder</div><div id="mEnc" class="value">—</div></div>
+    <div class="metric"><div class="label">Decoder</div><div id="mDec" class="value">—</div></div>
+    <div class="metric"><div class="label">Total</div><div id="mTot" class="value">—</div></div>
+    <div class="metric"><div class="label">IoU</div><div id="mIoU" class="value">—</div></div>
+    <div class="metric"><div class="label">Image</div><div id="mSz" class="value sm">—</div></div>
+  </div>
+  <div class="card"><strong>Log</strong><pre id="log"></pre></div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.all.min.js"></script>
+<script>
+const $=id=>document.getElementById(id),logEl=$("log");
+const VIS_FILE="vision_encoder_fp32.onnx",NECK_FILE="sam2_neck_fp32.onnx",DEC_FILE="sam2_decoder_fp32.onnx";
+const VIS_URL=`/models/sam2-hiera-large/${VIS_FILE}`,NECK_URL=`/models/sam2-hiera-large/${NECK_FILE}`,DEC_URL=`/models/sam2-hiera-large/${DEC_FILE}`;
+const PROMPT_URL="/models/sam2-hiera-large/prompt_encoder_params.json";
+const POSEMB_URL="/models/sam2-hiera-large/pos_embed.bin";
+const SAM=1024;
+let visSess=null,neckSess=null,decSess=null,promptParams=null,posEmbedData=null;
+let currentImg=null,origW=0,origH=0,busy=false;
+let cachedVisOut=null; // cache vision output per image
+
+function log(m){const t=new Date().toLocaleTimeString();logEl.textContent+=`[${t}] ${m}\n`;logEl.scrollTop=logEl.scrollHeight}
+function setStatus(t,c="warn"){$("status").textContent=t;$("status").className=`status ${c}`}
+async function opfs(){return navigator.storage.getDirectory()}
+async function getCached(n){try{const f=await(await opfs()).getFileHandle(n);const fl=await f.getFile();return fl.size>1000?fl:null}catch{return null}}
+async function dlCache(n,url,label){
+  $("dlProg").style.display="block";$("dlBar").style.width="0%";log(`Downloading ${label}...`);
+  const r=await fetch(url);if(!r.ok)throw new Error(`HTTP ${r.status}`);
+  const tot=+r.headers.get("Content-Length")||0;const rd=r.body.getReader();const ch=[];let rx=0;
+  while(true){const{done,value}=await rd.read();if(done)break;ch.push(value);rx+=value.length;
+    if(tot>0){$("dlBar").style.width=`${(rx/tot*100).toFixed(1)}%`;if(rx%(40*1024*1024)<value.length)log(`  ${(rx/1e6)|0}/${(tot/1e6)|0} MB`)}}
+  log(`${label}: ${(rx/1e6)|0} MB`);const root=await opfs();const fh=await root.getFileHandle(n,{create:true});
+  const w=await fh.createWritable();for(const c of ch)await w.write(c);await w.close();$("dlBar").style.width="100%";
+  return(await(await root.getFileHandle(n)).getFile())
+}
+$("clearBtn").addEventListener("click",async()=>{const r=await opfs();try{await r.removeEntry(VIS_FILE)}catch{}try{await r.removeEntry(NECK_FILE)}catch{}try{await r.removeEntry(DEC_FILE)}catch{}log("Cleared.");$("cacheInfo").textContent="Cleared."});
+
+// ─── Prompt encoder in JS ───
+function encodePrompt(pointX, pointY, label) {
+  // Implements SAM2's prompt encoder for a single point
+  const pp = promptParams;
+  const posEmb = pp.positional_embedding; // [2, 128]
+  const dim = posEmb[0].length * 2; // 256
+
+  // 1. Embed point: normalize to [0,1], shift, positional encode
+  const padPoints = [[pointX + 0.5, pointY + 0.5], [0, 0]]; // point + pad point
+  const padLabels = [label, -1]; // label + pad label (-1)
+
+  const embeddings = [];
+  for (let p = 0; p < 2; p++) {
+    const px = padPoints[p][0] / pp.input_image_size;
+    const py = padPoints[p][1] / pp.input_image_size;
+    const coords = [2 * px - 1, 2 * py - 1]; // scale to [-1, 1]
+
+    // coords @ positional_embedding → sin/cos
+    const embed = new Float32Array(dim);
+    for (let j = 0; j < posEmb[0].length; j++) {
+      const val = coords[0] * posEmb[0][j] + coords[1] * posEmb[1][j];
+      const angle = 2 * Math.PI * val;
+      embed[j] = Math.sin(angle);
+      embed[j + posEmb[0].length] = Math.cos(angle);
+    }
+
+    if (padLabels[p] === -1) {
+      // Replace with not_a_point_embed
+      for (let j = 0; j < dim; j++) embed[j] = pp.not_a_point_embed[j];
+    } else {
+      // Add point_embed for the label type (clamp to 0+)
+      const labelIdx = Math.max(0, padLabels[p]);
+      if (labelIdx < pp.point_embed.length) {
+        for (let j = 0; j < dim; j++) embed[j] += pp.point_embed[labelIdx][j];
+      }
+    }
+    embeddings.push(embed);
+  }
+
+  // sparse: [1, 1, 2, 256]
+  const sparse = new Float32Array(2 * dim);
+  sparse.set(embeddings[0], 0);
+  sparse.set(embeddings[1], dim);
+
+  // dense: [1, 256, 64, 64] — just no_mask_embed broadcast
+  const H = pp.image_embedding_size[0], W = pp.image_embedding_size[1];
+  const dense = new Float32Array(dim * H * W);
+  for (let hw = 0; hw < H * W; hw++) {
+    for (let c = 0; c < dim; c++) {
+      dense[c * H * W + hw] = pp.no_mask_embed[c];
+    }
+  }
+
+  return { sparse, dense };
+}
+
+// ─── Load ───
+$("loadBtn").addEventListener("click",async()=>{
+  $("loadBtn").disabled=true;
+  try{
+    // Download/cache all models
+    let vf=await getCached(VIS_FILE);if(vf)log(`Vision cached: ${(vf.size/1e6)|0} MB`);else vf=await dlCache(VIS_FILE,VIS_URL,"vision encoder");
+    let nf=await getCached(NECK_FILE);if(nf)log(`Neck cached: ${(nf.size/1e6)|0} MB`);else nf=await dlCache(NECK_FILE,NECK_URL,"neck convs");
+    let df=await getCached(DEC_FILE);if(df)log(`Decoder cached: ${(df.size/1e6)|0} MB`);else df=await dlCache(DEC_FILE,DEC_URL,"decoder");
+    $("cacheInfo").textContent=`Cached: vis ${(vf.size/1e6)|0}MB + neck ${(nf.size/1e6).toFixed(1)}MB + dec ${(df.size/1e6)|0}MB`;
+
+    log("Loading prompt encoder params...");
+    promptParams = await (await fetch(PROMPT_URL)).json();
+    const peBuf = await (await fetch(POSEMB_URL)).arrayBuffer();
+    posEmbedData = new Float32Array(peBuf);
+    log(`Prompt params loaded. Pos embed: ${posEmbedData.length} floats`);
+
+    // Load vision encoder (proven working on WebGPU at 881ms)
+    setStatus("Loading vision encoder into WebGPU...","warn");
+    const vab=await vf.arrayBuffer();log(`Vision read: ${(vab.byteLength/1e6)|0} MB`);
+    let ep="webgpu";const t0=performance.now();
+    try{visSess=await ort.InferenceSession.create(vab,{executionProviders:["webgpu"],graphOptimizationLevel:"all"})}
+    catch(e){log(`Vision WebGPU failed, trying WASM...`);ep="wasm";visSess=await ort.InferenceSession.create(vab,{executionProviders:["wasm"]})}
+    log(`Vision loaded (${ep}) ${((performance.now()-t0)/1000).toFixed(1)}s | out:${visSess.outputNames.length} outputs`);
+
+    // Load neck (tiny, 0.1MB)
+    setStatus("Loading neck...","warn");
+    const nab=await nf.arrayBuffer();
+    try{neckSess=await ort.InferenceSession.create(nab,{executionProviders:[ep],graphOptimizationLevel:"all"})}
+    catch(e){log(`Neck ${ep} failed, WASM...`);neckSess=await ort.InferenceSession.create(nab,{executionProviders:["wasm"]})}
+    log(`Neck loaded | in:${neckSess.inputNames} out:${neckSess.outputNames}`);
+
+    // Load decoder (16MB)
+    setStatus("Loading decoder...","warn");
+    const dab=await df.arrayBuffer();
+    try{decSess=await ort.InferenceSession.create(dab,{executionProviders:[ep],graphOptimizationLevel:"all"})}
+    catch(e){log(`Decoder ${ep} failed, WASM...`);decSess=await ort.InferenceSession.create(dab,{executionProviders:["wasm"]})}
+    log(`Decoder loaded | in:${decSess.inputNames} out:${decSess.outputNames}`);
+
+    $("mBk").textContent=ep;$("loadBtn").textContent="Loaded ✓";$("dogBtn").disabled=false;$("pickBtn").disabled=false;
+    setStatus(`Ready (${ep}). Load an image, click to segment.`,"good");
+  }catch(e){log(`Error: ${e.message}`);setStatus(`Error: ${e.message}`,"bad");$("loadBtn").disabled=false}
+});
+
+const cv=$("cv"),ctx=cv.getContext("2d");
+function showImg(img){currentImg=img;origW=img.naturalWidth;origH=img.naturalHeight;cachedVisOut=null;
+  const s=Math.min(700/origW,500/origH,1);cv.width=Math.round(origW*s);cv.height=Math.round(origH*s);
+  ctx.drawImage(img,0,0,cv.width,cv.height);$("cWrap").style.display="inline-block";$("hint").style.display="block";$("clrBtn").disabled=false;
+  $("mSz").textContent=`${origW}×${origH}`;$("cWrap").querySelectorAll(".pt").forEach(e=>e.remove());log(`Image: ${origW}×${origH}`)}
+$("dogBtn").addEventListener("click",()=>{const i=new Image();i.crossOrigin="anonymous";i.onload=()=>showImg(i);i.src="/test-images/dog.jpg"});
+$("pickBtn").addEventListener("click",()=>$("imgF").click());
+$("imgF").addEventListener("change",()=>{const f=$("imgF").files[0];if(!f)return;const i=new Image();i.onload=()=>showImg(i);i.src=URL.createObjectURL(f)});
+$("clrBtn").addEventListener("click",()=>{if(currentImg){ctx.drawImage(currentImg,0,0,cv.width,cv.height);$("cWrap").querySelectorAll(".pt").forEach(e=>e.remove());cachedVisOut=null}});
+
+cv.addEventListener("click",async(e)=>{
+  if(!visSess||!neckSess||!decSess||!currentImg||busy)return;busy=true;
+  const rect=cv.getBoundingClientRect(),cx=e.clientX-rect.left,cy=e.clientY-rect.top;
+  const imgX=(cx/cv.width)*origW,imgY=(cy/cv.height)*origH;
+  const longer=Math.max(origW,origH),scale=SAM/longer;
+  const samX=imgX*scale,samY=imgY*scale;
+  log(`\nClick → SAM(${samX.toFixed(0)},${samY.toFixed(0)})`);
+
+  $("cWrap").querySelectorAll(".pt").forEach(e=>e.remove());
+  const mk=document.createElement("div");mk.className="pt";mk.style.left=`${cx}px`;mk.style.top=`${cy}px`;$("cWrap").appendChild(mk);
+
+  let encMs=0;
+  try{
+    // Stage 1: Vision encoder + neck (cached per image)
+    if(!cachedVisOut){
+      setStatus("Running vision encoder...","warn");
+      const dw=Math.round(origW*scale),dh=Math.round(origH*scale);
+      const pc=document.createElement("canvas");pc.width=SAM;pc.height=SAM;
+      const px=pc.getContext("2d");px.fillStyle="black";px.fillRect(0,0,SAM,SAM);px.drawImage(currentImg,0,0,dw,dh);
+      const id=px.getImageData(0,0,SAM,SAM).data;
+      const pv=new Float32Array(3*SAM*SAM);
+      for(let i=0;i<SAM*SAM;i++){pv[i]=id[i*4]/255;pv[SAM*SAM+i]=id[i*4+1]/255;pv[2*SAM*SAM+i]=id[i*4+2]/255}
+      
+      // Vision encoder
+      const t0=performance.now();
+      const visOut=await visSess.run({[visSess.inputNames[0]]:new ort.Tensor("float32",pv,[1,3,SAM,SAM])});
+      const visMs=performance.now()-t0;
+      log(`Vision encoder: ${visMs.toFixed(0)} ms`);
+      
+      // Find FPN outputs by shape (outputs 1,2,3 are FPN states based on verification)
+      const visOutNames=visSess.outputNames;
+      const fpn0=visOut[visOutNames[1]]; // [1,256,256,256]
+      const fpn1=visOut[visOutNames[2]]; // [1,256,128,128]
+      const fpn2=visOut[visOutNames[3]]; // [1,256,64,64]
+      log(`FPN: [${fpn0.dims}] [${fpn1.dims}] [${fpn2.dims}]`);
+      
+      // Neck convolutions
+      setStatus("Running neck convs...","warn");
+      const t1=performance.now();
+      const neckOut=await neckSess.run({
+        [neckSess.inputNames[0]]:fpn0,
+        [neckSess.inputNames[1]]:fpn1,
+        [neckSess.inputNames[2]]:fpn2,
+      });
+      const neckMs=performance.now()-t1;
+      log(`Neck: ${neckMs.toFixed(0)} ms`);
+      
+      encMs=visMs+neckMs;
+      cachedVisOut=neckOut;
+      log(`Total encoder+neck: ${encMs.toFixed(0)} ms (cached for this image)`);
+      $("mEnc").textContent=`${encMs.toFixed(0)} ms`;
+    } else {
+      log("Using cached encoder output.");
+    }
+
+    // Stage 2: Prompt encoding in JS
+    setStatus("Encoding prompt...","warn");
+    const {sparse, dense} = encodePrompt(samX, samY, 1);
+
+    // Stage 3: Mask decoder
+    setStatus("Running decoder...","warn");
+    const neckOutNames=neckSess.outputNames;
+    const decFeeds = {
+      [decSess.inputNames[0]]: cachedVisOut[neckOutNames[0]], // image_embeddings
+      [decSess.inputNames[1]]: new ort.Tensor("float32", posEmbedData, [1,256,64,64]), // pos_embed
+      [decSess.inputNames[2]]: new ort.Tensor("float32", sparse, [1,1,2,256]), // sparse_prompt
+      [decSess.inputNames[3]]: new ort.Tensor("float32", dense, [1,256,64,64]), // dense_prompt
+      [decSess.inputNames[4]]: cachedVisOut[neckOutNames[1]], // hrf0
+      [decSess.inputNames[5]]: cachedVisOut[neckOutNames[2]], // hrf1
+    };
+
+    const t1=performance.now();
+    const decOut=await decSess.run(decFeeds);
+    const decMs=performance.now()-t1;
+    log(`Decoder: ${decMs.toFixed(0)} ms`);
+    $("mDec").textContent=`${decMs.toFixed(0)} ms`;
+    $("mTot").textContent=`${(encMs+decMs).toFixed(0)} ms`;
+
+    // Best mask
+    const maskT=decOut[decSess.outputNames[0]];
+    const scoreT=decOut[decSess.outputNames[1]];
+    const dims=maskT.dims,mH=dims[dims.length-2],mW=dims[dims.length-1];
+    const numMasks=dims.length>=5?dims[2]:1;
+    const scores=Float32Array.from(scoreT.data);
+    let bestIdx=0,bestScore=-1;
+    for(let i=0;i<numMasks;i++){if(scores[i]>bestScore){bestScore=scores[i];bestIdx=i}}
+    log(`Best: idx=${bestIdx}, IoU=${bestScore.toFixed(4)}`);
+    $("mIoU").textContent=bestScore.toFixed(3);
+
+    // Draw overlay
+    const maskData=maskT.data,offset=bestIdx*mH*mW;
+    ctx.drawImage(currentImg,0,0,cv.width,cv.height);
+    const ovr=ctx.getImageData(0,0,cv.width,cv.height),od=ovr.data;
+    for(let y=0;y<cv.height;y++){for(let x=0;x<cv.width;x++){
+      const ix=(x/cv.width)*origW,iy=(y/cv.height)*origH;
+      const mx=Math.floor((ix*scale/SAM)*mW),my=Math.floor((iy*scale/SAM)*mH);
+      if(mx>=0&&mx<mW&&my>=0&&my<mH&&Number(maskData[offset+my*mW+mx])>0){
+        const pi=(y*cv.width+x)*4;od[pi]=Math.min(255,od[pi]+100);od[pi+1]=od[pi+1]>>1;od[pi+2]=od[pi+2]>>1}
+    }}
+    ctx.putImageData(ovr,0,0);
+    const mk2=document.createElement("div");mk2.className="pt";mk2.style.left=`${cx}px`;mk2.style.top=`${cy}px`;$("cWrap").appendChild(mk2);
+    setStatus(`Done! Enc ${encMs.toFixed(0)}ms + Dec ${decMs.toFixed(0)}ms | IoU ${bestScore.toFixed(3)}`,"good");
+  }catch(e){log(`Error: ${e.message}\n${e.stack||""}`);setStatus(`Error: ${e.message}`,"bad")}
+  busy=false;
+});
+
+(async()=>{
+  const vf=await getCached(VIS_FILE),nf=await getCached(NECK_FILE),df=await getCached(DEC_FILE);
+  if(vf&&df){$("cacheInfo").textContent=`Cached: vis ${(vf.size/1e6)|0}MB + dec ${(df.size/1e6)|0}MB`;setStatus("Cached. Click 'Load'.","good")}
+  else{$("cacheInfo").textContent="Not cached (~869 MiB)";setStatus("Click 'Load' to download.","warn")}
+})();
+</script>
+</body>
+</html>

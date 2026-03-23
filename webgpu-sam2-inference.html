@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGPU SAM2 Inference — Hiera Large</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020; --panel: #121a33; --panel-2: #0f1730;
+      --text: #e7ecff; --muted: #a6b0d5; --good: #66e3a4;
+      --warn: #ffd166; --bad: #ff7b7b; --border: #26345f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #0a0f1d, #0b1020 40%, #0d1327);
+      color: var(--text);
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 32px 20px 48px; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { margin: 8px 0; color: var(--muted); }
+    .card {
+      background: rgba(18, 26, 51, 0.9);
+      border: 1px solid var(--border); border-radius: 16px;
+      padding: 18px; margin-top: 18px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.22);
+    }
+    button {
+      border-radius: 10px; border: 0;
+      background: linear-gradient(180deg, #1c6fff, #1758cc);
+      color: var(--text); padding: 10px 16px;
+      font: inherit; font-weight: 700; cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .secondary { background: #1a2447; border: 1px solid var(--border); }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    .status {
+      padding: 12px 14px; border-radius: 12px;
+      border: 1px solid var(--border); background: #101833;
+      margin-top: 12px; white-space: pre-wrap;
+    }
+    .status.good { border-color: rgba(102,227,164,0.35); color: var(--good); }
+    .status.warn { border-color: rgba(255,209,102,0.35); color: var(--warn); }
+    .status.bad { border-color: rgba(255,123,123,0.35); color: var(--bad); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px; margin-top: 16px;
+    }
+    .metric {
+      background: #0e1630; border: 1px solid var(--border);
+      border-radius: 12px; padding: 12px;
+    }
+    .metric .label {
+      font-size: 12px; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.04em;
+    }
+    .metric .value { margin-top: 8px; font-size: 22px; font-weight: 800; }
+    .metric .value.small-value { font-size: 16px; }
+    pre {
+      margin: 0; background: #0b1228;
+      border: 1px solid var(--border); border-radius: 12px;
+      padding: 14px; overflow: auto; max-height: 480px; color: #cfe0ff;
+    }
+    .small { font-size: 12px; color: var(--muted); }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .progress { width: 100%; height: 8px; background: var(--panel-2); border-radius: 4px; margin-top: 8px; overflow: hidden; }
+    .progress-bar { height: 100%; background: linear-gradient(90deg, #1c6fff, #66e3a4); border-radius: 4px; transition: width 0.3s; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>WebGPU SAM2 — Hiera Large Vision Encoder</h1>
+    <p>
+      Runs the SAM 2.1 Hiera Large vision encoder (213M params, 1024×1024 input)
+      in the browser via ONNX Runtime Web + WebGPU.
+      This is the heavy compute backbone of Segment Anything 2.
+    </p>
+
+    <div id="status" class="status warn">Initializing...</div>
+
+    <div class="card">
+      <strong>Model</strong>
+      <p class="small">
+        Vision encoder from <code>facebook/sam2.1-hiera-large</code> (~852 MiB FP32 ONNX).
+        Cached in browser storage (OPFS) after first download.
+      </p>
+      <div class="row">
+        <button id="loadModelBtn">Load / Download model → WebGPU</button>
+        <button id="clearCacheBtn" class="secondary">Clear cache</button>
+      </div>
+      <div id="cacheStatus" class="small" style="margin-top:8px">Checking cache...</div>
+      <div class="progress" id="downloadProgress" style="display:none">
+        <div class="progress-bar" id="downloadBar" style="width:0%"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <strong>Benchmark</strong>
+      <div class="row">
+        <button id="benchBtn" disabled>Run benchmark (random 1024×1024 tensor)</button>
+      </div>
+      <p class="small">
+        Runs a warmup pass then 5 timed forward passes of the vision encoder on a random input.
+        This measures the full image encoding cost — the heaviest part of SAM2.
+      </p>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="label">Model</div><div id="modelName" class="value small-value">—</div></div>
+      <div class="metric"><div class="label">Parameters</div><div id="params" class="value small-value">—</div></div>
+      <div class="metric"><div class="label">Backend</div><div id="backend" class="value small-value">—</div></div>
+      <div class="metric"><div class="label">Model load time</div><div id="loadTime" class="value">—</div></div>
+      <div class="metric"><div class="label">Inference avg</div><div id="inferAvg" class="value">—</div></div>
+      <div class="metric"><div class="label">Inference min</div><div id="inferMin" class="value">—</div></div>
+    </div>
+
+    <div class="card">
+      <strong>Log</strong>
+      <pre id="log"></pre>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.all.min.js"></script>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const logEl = $("log");
+
+    const MODEL_FILENAME = "vision_encoder_fp32.onnx";
+    const MODEL_URL = `/models/sam2-hiera-large/${MODEL_FILENAME}`;
+
+    let session = null;
+
+    // float32 → float16
+    const f32Buf = new Float32Array(1);
+    const u32Buf = new Uint32Array(f32Buf.buffer);
+    function float32ToFloat16(val) {
+      f32Buf[0] = val;
+      const f = u32Buf[0];
+      const sign = (f >> 16) & 0x8000;
+      const exp = ((f >> 23) & 0xff) - 127 + 15;
+      const frac = (f >> 13) & 0x03ff;
+      if (exp <= 0) return sign;
+      if (exp >= 31) return sign | 0x7c00;
+      return sign | (exp << 10) | frac;
+    }
+
+    function log(msg) {
+      const t = new Date().toLocaleTimeString();
+      logEl.textContent += `[${t}] ${msg}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setStatus(text, cls = "warn") {
+      $("status").textContent = text;
+      $("status").className = `status ${cls}`;
+    }
+
+    // ─── OPFS ───
+    async function getOPFSRoot() { return navigator.storage.getDirectory(); }
+
+    async function getCachedModel() {
+      try {
+        const root = await getOPFSRoot();
+        const fh = await root.getFileHandle(MODEL_FILENAME);
+        const file = await fh.getFile();
+        return file.size > 1000 ? file : null;
+      } catch { return null; }
+    }
+
+    async function downloadAndCache() {
+      $("downloadProgress").style.display = "block";
+      log("Downloading SAM2 vision encoder...");
+      setStatus("Downloading model (~408 MiB)...", "warn");
+
+      const resp = await fetch(MODEL_URL);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+      const total = +resp.headers.get("Content-Length") || 0;
+      const reader = resp.body.getReader();
+      const chunks = [];
+      let received = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        if (total > 0) {
+          const pct = ((received / total) * 100).toFixed(1);
+          $("downloadBar").style.width = `${pct}%`;
+          if (received % (20 * 1024 * 1024) < value.length) {
+            log(`  ${(received / 1e6).toFixed(0)} / ${(total / 1e6).toFixed(0)} MB (${pct}%)`);
+          }
+        }
+      }
+
+      log(`Download complete: ${(received / 1e6).toFixed(0)} MB`);
+      log("Caching in OPFS...");
+      const root = await getOPFSRoot();
+      const fh = await root.getFileHandle(MODEL_FILENAME, { create: true });
+      const w = await fh.createWritable();
+      for (const c of chunks) await w.write(c);
+      await w.close();
+
+      $("downloadBar").style.width = "100%";
+      log("Cached ✓");
+      return (await (await root.getFileHandle(MODEL_FILENAME)).getFile());
+    }
+
+    $("clearCacheBtn").addEventListener("click", async () => {
+      try {
+        const root = await getOPFSRoot();
+        await root.removeEntry(MODEL_FILENAME);
+        log("Cache cleared.");
+        $("cacheStatus").textContent = "Cache cleared.";
+        $("loadModelBtn").disabled = false;
+        $("loadModelBtn").textContent = "Load / Download model → WebGPU";
+      } catch (e) { log(`Clear: ${e.message}`); }
+    });
+
+    // ─── Load ───
+    $("loadModelBtn").addEventListener("click", async () => {
+      $("loadModelBtn").disabled = true;
+      try {
+        let file = await getCachedModel();
+        if (file) {
+          log(`Model found in cache: ${(file.size / 1e6).toFixed(0)} MB`);
+          $("cacheStatus").textContent = `Cached: ${MODEL_FILENAME} (${(file.size / 1e6).toFixed(0)} MB)`;
+        } else {
+          file = await downloadAndCache();
+        }
+
+        setStatus("Loading model into WebGPU...", "warn");
+        log("Reading into memory...");
+        const ab = await file.arrayBuffer();
+        log(`Read: ${(ab.byteLength / 1e6).toFixed(0)} MB`);
+
+        let ep = "webgpu";
+        log(`Initializing ONNX Runtime (${ep})...`);
+        const t0 = performance.now();
+        try {
+          session = await ort.InferenceSession.create(ab, {
+            executionProviders: [ep],
+            graphOptimizationLevel: "all",
+          });
+        } catch (e) {
+          log(`WebGPU failed: ${e.message}`);
+          log("Falling back to WASM...");
+          ep = "wasm";
+          session = await ort.InferenceSession.create(ab, {
+            executionProviders: ["wasm"],
+            graphOptimizationLevel: "all",
+          });
+        }
+        const loadMs = performance.now() - t0;
+
+        log(`Loaded on ${ep} in ${loadMs.toFixed(0)} ms`);
+        log(`Inputs: ${session.inputNames}`);
+        log(`Outputs: ${session.outputNames}`);
+
+        $("modelName").textContent = "SAM2.1 Hiera-L";
+        $("params").textContent = "213M";
+        $("backend").textContent = ep;
+        $("loadTime").textContent = `${(loadMs / 1000).toFixed(1)} s`;
+        $("loadModelBtn").textContent = "Model loaded ✓";
+        $("benchBtn").disabled = false;
+
+        setStatus(`Model loaded on ${ep}. Click 'Run benchmark'.`, "good");
+      } catch (e) {
+        log(`Failed: ${e.message}`);
+        setStatus(`Failed: ${e.message}`, "bad");
+        $("loadModelBtn").disabled = false;
+      }
+    });
+
+    // ─── Benchmark ───
+    $("benchBtn").addEventListener("click", async () => {
+      if (!session) return;
+      $("benchBtn").disabled = true;
+
+      const SZ = 1024;
+      const count = 3 * SZ * SZ;
+      log(`\nGenerating random ${SZ}×${SZ} float32 tensor (${(count * 4 / 1e6).toFixed(1)} MB)...`);
+
+      const f32 = new Float32Array(count);
+      for (let i = 0; i < count; i++) {
+        f32[i] = (Math.random() - 0.5) * 2;
+      }
+
+      const tensor = new ort.Tensor("float32", f32, [1, 3, SZ, SZ]);
+      const feeds = {};
+      feeds[session.inputNames[0]] = tensor;
+
+      log("Warmup run...");
+      const warmT0 = performance.now();
+      await session.run(feeds);
+      const warmMs = performance.now() - warmT0;
+      log(`Warmup: ${warmMs.toFixed(0)} ms`);
+
+      const N = 5;
+      const times = [];
+      log(`Running ${N} timed forward passes...`);
+
+      for (let i = 0; i < N; i++) {
+        const t0 = performance.now();
+        const results = await session.run(feeds);
+        const ms = performance.now() - t0;
+        times.push(ms);
+
+        // Report output shape on first run
+        if (i === 0) {
+          for (const name of session.outputNames) {
+            const out = results[name];
+            log(`  Output '${name}': shape=[${out.dims}], dtype=${out.type}`);
+          }
+        }
+        log(`  Run ${i + 1}: ${ms.toFixed(1)} ms`);
+      }
+
+      const avg = times.reduce((a, b) => a + b, 0) / times.length;
+      const min = Math.min(...times);
+      const max = Math.max(...times);
+
+      log(`\nResults over ${N} runs:`);
+      log(`  avg: ${avg.toFixed(1)} ms`);
+      log(`  min: ${min.toFixed(1)} ms`);
+      log(`  max: ${max.toFixed(1)} ms`);
+      log(`  warmup was: ${warmMs.toFixed(1)} ms`);
+
+      $("inferAvg").textContent = `${avg.toFixed(0)} ms`;
+      $("inferMin").textContent = `${min.toFixed(0)} ms`;
+
+      $("benchBtn").disabled = false;
+      setStatus(`Benchmark complete. Avg: ${avg.toFixed(0)} ms per forward pass.`, "good");
+    });
+
+    // ─── Init ───
+    (async () => {
+      const file = await getCachedModel();
+      if (file) {
+        log(`Model cached: ${(file.size / 1e6).toFixed(0)} MB`);
+        $("cacheStatus").textContent = `Cached: ${MODEL_FILENAME} (${(file.size / 1e6).toFixed(0)} MB)`;
+        setStatus("Model cached. Click 'Load' to initialize on WebGPU.", "good");
+      } else {
+        log("No cached model. Click 'Load' to download (~408 MiB).");
+        $("cacheStatus").textContent = "Not cached — will download on first load (~408 MiB)";
+        setStatus("Click 'Load' to download SAM2 vision encoder and run on WebGPU.", "warn");
+      }
+      if (!navigator.gpu) log("⚠ WebGPU not detected — will fall back to WASM.");
+    })();
+  </script>
+</body>
+</html>

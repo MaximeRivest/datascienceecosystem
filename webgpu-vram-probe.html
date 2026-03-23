@@ -1,0 +1,746 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGPU VRAM Probe</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #121a33;
+      --panel-2: #0f1730;
+      --text: #e7ecff;
+      --muted: #a6b0d5;
+      --good: #66e3a4;
+      --warn: #ffd166;
+      --bad: #ff7b7b;
+      --border: #26345f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #0a0f1d, #0b1020 40%, #0d1327);
+      color: var(--text);
+    }
+    .wrap {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    h2 { margin: 18px 0 8px; font-size: 20px; }
+    p { margin: 8px 0; color: var(--muted); }
+    .card {
+      background: rgba(18, 26, 51, 0.9);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      margin-top: 18px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.22);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+    label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    input, select, button {
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+    }
+    button {
+      background: linear-gradient(180deg, #1c6fff, #1758cc);
+      border: 0;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .secondary { background: #1a2447; border: 1px solid var(--border); }
+    .danger { background: linear-gradient(180deg, #c14444, #9e2f2f); }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    .status {
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #101833;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
+    .status.good { border-color: rgba(102, 227, 164, 0.35); color: var(--good); }
+    .status.warn { border-color: rgba(255, 209, 102, 0.35); color: var(--warn); }
+    .status.bad { border-color: rgba(255, 123, 123, 0.35); color: var(--bad); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .metric {
+      background: #0e1630;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .metric .label {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .metric .value {
+      margin-top: 8px;
+      font-size: 22px;
+      font-weight: 800;
+    }
+    .metric .value.small-value {
+      font-size: 16px;
+    }
+    pre {
+      margin: 0;
+      background: #0b1228;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+      max-height: 480px;
+      color: #cfe0ff;
+    }
+    .small { font-size: 12px; color: var(--muted); }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      font-size: 13px;
+    }
+    th, td {
+      text-align: left;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+    }
+    th { color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.04em; }
+    td { color: var(--text); }
+    td.num { text-align: right; font-family: ui-monospace, monospace; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>WebGPU VRAM Probe</h1>
+    <p>
+      Probes how much GPU memory a browser tab can allocate and retain via WebGPU.
+      This is the GPU equivalent of <code>memory-bank.html</code>: find the empirical VRAM ceiling
+      before building anything on top of it.
+    </p>
+
+    <div id="gpuStatus" class="status warn">Checking WebGPU availability...</div>
+
+    <!-- Adapter info -->
+    <div class="card" id="adapterCard" style="display:none">
+      <strong>GPU Adapter</strong>
+      <div id="adapterInfo"></div>
+    </div>
+
+    <!-- Device limits -->
+    <div class="card" id="limitsCard" style="display:none">
+      <strong>Reported Device Limits</strong>
+      <div id="limitsTable"></div>
+    </div>
+
+    <!-- Probe controls -->
+    <div class="card">
+      <strong>VRAM Probe Setup</strong>
+      <div class="grid">
+        <label>
+          Buffer size (MiB)
+          <input id="bufferMiB" type="number" min="1" step="1" value="256" />
+        </label>
+        <label>
+          Target total (GiB)
+          <input id="targetGiB" type="number" min="0.25" step="0.25" value="8" />
+        </label>
+        <label>
+          Max buffer attempts
+          <input id="maxBuffers" type="number" min="1" step="1" value="128" />
+        </label>
+        <label>
+          Pause between allocations (ms)
+          <input id="pauseMs" type="number" min="0" step="50" value="100" />
+        </label>
+        <label>
+          Verify with compute shader
+          <select id="verifyCompute">
+            <option value="yes" selected>Yes — write + readback each buffer</option>
+            <option value="no">No — allocate only (faster)</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="row">
+        <button id="initBtn">1. Init WebGPU</button>
+        <button id="startBtn" disabled>2. Start VRAM probe</button>
+        <button id="stopBtn" class="secondary" disabled>Stop</button>
+        <button id="releaseBtn" class="danger" disabled>Release all GPU buffers</button>
+      </div>
+
+      <p class="small">
+        Start with <code>256 MiB</code> buffers and an <code>8 GiB</code> target.
+        "Verify with compute shader" writes a known pattern to each buffer via a GPU compute dispatch,
+        reads it back, and confirms the memory is real — not just an address reservation.
+      </p>
+    </div>
+
+    <!-- Live metrics -->
+    <div class="metrics">
+      <div class="metric"><div class="label">GPU</div><div id="gpuName" class="value small-value">—</div></div>
+      <div class="metric"><div class="label">maxBufferSize</div><div id="maxBufSize" class="value small-value">—</div></div>
+      <div class="metric"><div class="label">maxStorageBufferBindingSize</div><div id="maxStorageBind" class="value small-value">—</div></div>
+      <div class="metric"><div class="label">Allocated buffers</div><div id="bufCount" class="value">0</div></div>
+      <div class="metric"><div class="label">Total VRAM allocated</div><div id="totalVRAM" class="value">0 B</div></div>
+      <div class="metric"><div class="label">Verified via compute</div><div id="verifiedVRAM" class="value">0 B</div></div>
+      <div class="metric"><div class="label">Status</div><div id="probeStatus" class="value small-value">ready</div></div>
+    </div>
+
+    <!-- Log -->
+    <div class="card">
+      <strong>Log</strong>
+      <pre id="log"></pre>
+    </div>
+  </div>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const logEl = $("log");
+
+    let adapter = null;
+    let device = null;
+    let bufferBank = [];
+    let verifiedBytes = 0;
+    let stopRequested = false;
+    let running = false;
+    let computePipeline = null;
+    let bindGroupLayout = null;
+
+    function log(msg) {
+      const t = new Date().toLocaleTimeString();
+      logEl.textContent += `[${t}] ${msg}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes)) return "—";
+      const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+      let v = bytes, u = 0;
+      while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
+      return `${v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2)} ${units[u]}`;
+    }
+
+    function formatNumber(v) {
+      if (!Number.isFinite(v)) return "—";
+      return new Intl.NumberFormat().format(v);
+    }
+
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+    function nextFrame() { return new Promise(r => requestAnimationFrame(r)); }
+
+    function totalAllocated() {
+      return bufferBank.reduce((s, b) => s + b.size, 0);
+    }
+
+    function updateMetrics(status) {
+      $("bufCount").textContent = formatNumber(bufferBank.length);
+      $("totalVRAM").textContent = formatBytes(totalAllocated());
+      $("verifiedVRAM").textContent = formatBytes(verifiedBytes);
+      if (status) $("probeStatus").textContent = status;
+    }
+
+    // ─── Compute shader for verification ───
+    // Uses 2D dispatch to handle buffers larger than 65535*256 u32s (~64 MiB).
+    // Global index = gid.y * (num_workgroups_x * 256) + gid.x
+    const VERIFY_SHADER = `
+      @group(0) @binding(0) var<storage, read_write> data: array<u32>;
+      @group(0) @binding(1) var<uniform> params: vec4u;  // x = num_workgroups_x * 256
+
+      @compute @workgroup_size(256)
+      fn fill(@builtin(global_invocation_id) gid: vec3u) {
+        let idx = gid.y * params.x + gid.x;
+        if (idx < arrayLength(&data)) {
+          data[idx] = idx ^ 0xDEADBEEFu;
+        }
+      }
+    `;
+
+    const MAX_WG = 65535;
+
+    function setupComputePipeline() {
+      const shaderModule = device.createShaderModule({ code: VERIFY_SHADER });
+
+      bindGroupLayout = device.createBindGroupLayout({
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+          { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+        ]
+      });
+
+      const pipelineLayout = device.createPipelineLayout({
+        bindGroupLayouts: [bindGroupLayout]
+      });
+
+      computePipeline = device.createComputePipeline({
+        layout: pipelineLayout,
+        compute: { module: shaderModule, entryPoint: "fill" }
+      });
+    }
+
+    function dispatch2D(u32Count) {
+      const totalWG = Math.ceil(u32Count / 256);
+      const wgX = Math.min(totalWG, MAX_WG);
+      const wgY = Math.ceil(totalWG / wgX);
+      return { wgX, wgY, strideX: wgX * 256 };
+    }
+
+    function createParamsBuffer(strideX) {
+      const buf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(buf, 0, new Uint32Array([strideX, 0, 0, 0]));
+      return buf;
+    }
+
+    async function verifyBuffer(gpuBuffer, bufferSizeBytes) {
+      const maxBindSize = device.limits.maxStorageBufferBindingSize;
+      const bindSize = Math.min(maxBindSize, bufferSizeBytes);
+      const u32Count = bindSize / 4;
+
+      const { wgX, wgY, strideX } = dispatch2D(u32Count);
+      const paramsBuf = createParamsBuffer(strideX);
+
+      const bindGroup = device.createBindGroup({
+        layout: bindGroupLayout,
+        entries: [
+          { binding: 0, resource: { buffer: gpuBuffer, offset: 0, size: bindSize } },
+          { binding: 1, resource: { buffer: paramsBuf } },
+        ]
+      });
+
+      const encoder = device.createCommandEncoder();
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(computePipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(wgX, wgY);
+      pass.end();
+
+      // Readback a spot-check (max 4 MiB)
+      const spotCheckBytes = Math.min(4 * 1024 * 1024, bindSize);
+      const readbackBuffer = device.createBuffer({
+        size: spotCheckBytes,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+      });
+      encoder.copyBufferToBuffer(gpuBuffer, 0, readbackBuffer, 0, spotCheckBytes);
+      device.queue.submit([encoder.finish()]);
+      await device.queue.onSubmittedWorkDone();
+
+      await readbackBuffer.mapAsync(GPUMapMode.READ);
+      const result = new Uint32Array(readbackBuffer.getMappedRange());
+      const spotCheckU32 = spotCheckBytes / 4;
+
+      let errors = 0;
+      const step = Math.max(1, Math.floor(spotCheckU32 / 1024));
+      for (let i = 0; i < spotCheckU32; i += step) {
+        const expected = (i ^ 0xDEADBEEF) >>> 0;
+        if (result[i] !== expected) {
+          errors++;
+          if (errors <= 3) {
+            log(`  verify error at u32[${i}]: got ${result[i]}, expected ${expected}`);
+          }
+        }
+      }
+
+      readbackBuffer.unmap();
+      readbackBuffer.destroy();
+      paramsBuf.destroy();
+
+      return errors === 0;
+    }
+
+    // Fill buffer in chunks <= maxStorageBufferBindingSize, using 2D dispatch
+    async function fillFullBuffer(gpuBuffer, bufferSizeBytes) {
+      const maxBindSize = device.limits.maxStorageBufferBindingSize;
+      const chunkBytes = Math.min(maxBindSize, bufferSizeBytes);
+      const numChunks = Math.ceil(bufferSizeBytes / chunkBytes);
+
+      for (let c = 0; c < numChunks; c++) {
+        const offset = c * chunkBytes;
+        const remaining = bufferSizeBytes - offset;
+        const thisChunk = Math.min(chunkBytes, remaining);
+        if (thisChunk % 4 !== 0) continue;
+
+        const u32Count = thisChunk / 4;
+        const { wgX, wgY, strideX } = dispatch2D(u32Count);
+        const paramsBuf = createParamsBuffer(strideX);
+
+        const bindGroup = device.createBindGroup({
+          layout: bindGroupLayout,
+          entries: [
+            { binding: 0, resource: { buffer: gpuBuffer, offset, size: thisChunk } },
+            { binding: 1, resource: { buffer: paramsBuf } },
+          ]
+        });
+
+        const encoder = device.createCommandEncoder();
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(computePipeline);
+        pass.setBindGroup(0, bindGroup);
+        pass.dispatchWorkgroups(wgX, wgY);
+        pass.end();
+        device.queue.submit([encoder.finish()]);
+        paramsBuf.destroy();
+      }
+
+      await device.queue.onSubmittedWorkDone();
+    }
+
+    // ─── Init ───
+    async function initWebGPU() {
+      logEl.textContent = "";
+      log("Checking WebGPU support...");
+
+      if (!navigator.gpu) {
+        $("gpuStatus").className = "status bad";
+        $("gpuStatus").textContent = "WebGPU is NOT available in this browser.\nTry Chrome/Chromium 113+ or Edge 113+.";
+        log("FAIL: navigator.gpu is undefined.");
+        return;
+      }
+
+      log("Requesting GPU adapter...");
+      try {
+        adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+      } catch (e) {
+        $("gpuStatus").className = "status bad";
+        $("gpuStatus").textContent = `Adapter request failed: ${e.message}`;
+        log(`FAIL: ${e.message}`);
+        return;
+      }
+
+      if (!adapter) {
+        $("gpuStatus").className = "status bad";
+        $("gpuStatus").textContent = "No GPU adapter found. Check GPU drivers and chrome://gpu.";
+        log("FAIL: requestAdapter returned null.");
+        return;
+      }
+
+      // Show adapter info
+      let adapterInfoStr = "";
+      try {
+        const info = await adapter.requestAdapterInfo();
+        adapterInfoStr = [
+          `Vendor: ${info.vendor || "unknown"}`,
+          `Architecture: ${info.architecture || "unknown"}`,
+          `Device: ${info.device || "unknown"}`,
+          `Description: ${info.description || "unknown"}`,
+        ].join("\n");
+        $("gpuName").textContent = info.description || info.device || info.vendor || "unknown";
+      } catch (e) {
+        // Older API: adapterInfo might be a property
+        try {
+          const info = adapter.info || {};
+          adapterInfoStr = [
+            `Vendor: ${info.vendor || "unknown"}`,
+            `Architecture: ${info.architecture || "unknown"}`,
+            `Device: ${info.device || "unknown"}`,
+            `Description: ${info.description || "unknown"}`,
+          ].join("\n");
+          $("gpuName").textContent = info.description || info.device || info.vendor || "unknown";
+        } catch (_) {
+          adapterInfoStr = "Could not retrieve adapter info.";
+        }
+      }
+
+      $("adapterCard").style.display = "block";
+      $("adapterInfo").innerHTML = `<pre>${adapterInfoStr}</pre>`;
+      log("Adapter found:\n" + adapterInfoStr);
+
+      // Determine what limits to request
+      const adapterMaxBuf = adapter.limits.maxBufferSize;
+      const adapterMaxStorage = adapter.limits.maxStorageBufferBindingSize;
+      log(`Adapter maxBufferSize: ${formatBytes(adapterMaxBuf)} (${formatNumber(adapterMaxBuf)})`);
+      log(`Adapter maxStorageBufferBindingSize: ${formatBytes(adapterMaxStorage)} (${formatNumber(adapterMaxStorage)})`);
+
+      // Request device with maximum limits
+      log("Requesting device with maximum buffer limits...");
+      const requiredLimits = {
+        maxBufferSize: adapterMaxBuf,
+        maxStorageBufferBindingSize: adapterMaxStorage,
+        maxComputeWorkgroupSizeX: adapter.limits.maxComputeWorkgroupSizeX,
+        maxComputeWorkgroupsPerDimension: adapter.limits.maxComputeWorkgroupsPerDimension,
+      };
+
+      try {
+        device = await adapter.requestDevice({
+          requiredLimits: requiredLimits
+        });
+      } catch (e) {
+        log(`Device request with max limits failed: ${e.message}`);
+        log("Retrying with default limits...");
+        try {
+          device = await adapter.requestDevice();
+        } catch (e2) {
+          $("gpuStatus").className = "status bad";
+          $("gpuStatus").textContent = `Device request failed: ${e2.message}`;
+          log(`FAIL: ${e2.message}`);
+          return;
+        }
+      }
+
+      device.lost.then(info => {
+        log(`⚠ GPU device lost: ${info.message} (reason: ${info.reason})`);
+        $("gpuStatus").className = "status bad";
+        $("gpuStatus").textContent = `GPU device lost: ${info.message}`;
+        $("startBtn").disabled = true;
+      });
+
+      // Handle uncaptured errors
+      device.addEventListener("uncapturederror", (event) => {
+        log(`⚠ GPU uncaptured error: ${event.error.message}`);
+      });
+
+      // Show limits
+      const limits = device.limits;
+      const limitsData = [
+        ["maxBufferSize", limits.maxBufferSize],
+        ["maxStorageBufferBindingSize", limits.maxStorageBufferBindingSize],
+        ["maxStorageBuffersPerShaderStage", limits.maxStorageBuffersPerShaderStage],
+        ["maxComputeWorkgroupSizeX", limits.maxComputeWorkgroupSizeX],
+        ["maxComputeWorkgroupsPerDimension", limits.maxComputeWorkgroupsPerDimension],
+        ["maxBindGroups", limits.maxBindGroups],
+        ["maxUniformBufferBindingSize", limits.maxUniformBufferBindingSize],
+      ];
+
+      let tableHTML = `<table><tr><th>Limit</th><th>Value</th><th>Bytes</th></tr>`;
+      for (const [name, val] of limitsData) {
+        const bytesCol = (name.toLowerCase().includes("size") || name.toLowerCase().includes("buffer"))
+          ? formatBytes(val) : "—";
+        tableHTML += `<tr><td><code>${name}</code></td><td class="num">${formatNumber(val)}</td><td class="num">${bytesCol}</td></tr>`;
+      }
+      tableHTML += `</table>`;
+      $("limitsCard").style.display = "block";
+      $("limitsTable").innerHTML = tableHTML;
+
+      $("maxBufSize").textContent = formatBytes(limits.maxBufferSize);
+      $("maxStorageBind").textContent = formatBytes(limits.maxStorageBufferBindingSize);
+
+      log(`Device maxBufferSize: ${formatBytes(limits.maxBufferSize)}`);
+      log(`Device maxStorageBufferBindingSize: ${formatBytes(limits.maxStorageBufferBindingSize)}`);
+
+      // Setup compute pipeline for verification
+      setupComputePipeline();
+      log("Compute verification pipeline ready.");
+
+      $("gpuStatus").className = "status good";
+      $("gpuStatus").textContent = "WebGPU initialized. GPU device ready.";
+      $("startBtn").disabled = false;
+      $("releaseBtn").disabled = false;
+      $("initBtn").disabled = true;
+
+      updateMetrics("ready");
+      log("Ready. Configure buffer size and target, then start the VRAM probe.");
+    }
+
+    // ─── Probe ───
+    async function runProbe() {
+      if (!device || running) return;
+
+      const bufferMiB = Number($("bufferMiB").value);
+      const targetGiB = Number($("targetGiB").value);
+      const maxBuffers = Number($("maxBuffers").value);
+      const pauseMs = Number($("pauseMs").value);
+      const doVerify = $("verifyCompute").value === "yes";
+
+      if (bufferMiB <= 0 || targetGiB <= 0 || maxBuffers <= 0) {
+        log("Invalid parameters.");
+        return;
+      }
+
+      const bufferBytes = bufferMiB * 1024 * 1024;
+      const targetBytes = targetGiB * 1024 * 1024 * 1024;
+
+      // Check against device limit
+      if (bufferBytes > device.limits.maxBufferSize) {
+        log(`Buffer size ${formatBytes(bufferBytes)} exceeds maxBufferSize ${formatBytes(device.limits.maxBufferSize)}.`);
+        log(`Clamping to maxBufferSize.`);
+      }
+      const effectiveBufferBytes = Math.min(bufferBytes, device.limits.maxBufferSize);
+
+      running = true;
+      stopRequested = false;
+      $("startBtn").disabled = true;
+      $("stopBtn").disabled = false;
+      verifiedBytes = 0;
+
+      log(`\n--- VRAM Probe Start ---`);
+      log(`Buffer size: ${formatBytes(effectiveBufferBytes)}`);
+      log(`Target: ${formatBytes(targetBytes)}`);
+      log(`Max attempts: ${maxBuffers}`);
+      log(`Compute verification: ${doVerify ? "ON" : "OFF"}`);
+      log(``);
+
+      let attempts = 0;
+      let lastError = null;
+
+      while (attempts < maxBuffers && !stopRequested) {
+        if (totalAllocated() >= targetBytes) {
+          log(`\n✓ Target reached: ${formatBytes(totalAllocated())}`);
+          break;
+        }
+
+        attempts++;
+        const label = `Buffer #${attempts}`;
+
+        let gpuBuffer;
+        try {
+          gpuBuffer = device.createBuffer({
+            size: effectiveBufferBytes,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+            mappedAtCreation: false,
+          });
+        } catch (e) {
+          lastError = e;
+          log(`${label}: allocation FAILED — ${e.message}`);
+          break;
+        }
+
+        // Check for allocation failure (some impls return a buffer but it's invalid)
+        if (!gpuBuffer || gpuBuffer.size === 0) {
+          log(`${label}: allocation returned empty/null buffer.`);
+          lastError = new Error("empty buffer");
+          break;
+        }
+
+        bufferBank.push(gpuBuffer);
+
+        if (doVerify) {
+          try {
+            await fillFullBuffer(gpuBuffer, effectiveBufferBytes);
+            const ok = await verifyBuffer(gpuBuffer, effectiveBufferBytes);
+            if (ok) {
+              verifiedBytes += effectiveBufferBytes;
+              log(`${label}: ${formatBytes(effectiveBufferBytes)} allocated + verified ✓  (total: ${formatBytes(totalAllocated())})`);
+            } else {
+              log(`${label}: ${formatBytes(effectiveBufferBytes)} allocated but VERIFY FAILED ✗`);
+              // Still keep it in the bank — it was allocated
+            }
+          } catch (e) {
+            log(`${label}: ${formatBytes(effectiveBufferBytes)} allocated but compute/readback failed: ${e.message}`);
+            // Check if device was lost
+            if (device.lost) {
+              try {
+                const lostInfo = await Promise.race([device.lost, sleep(500).then(() => null)]);
+                if (lostInfo) {
+                  log(`GPU device was lost during verification: ${lostInfo.message}`);
+                  lastError = new Error(`device lost: ${lostInfo.message}`);
+                  break;
+                }
+              } catch (_) {}
+            }
+          }
+        } else {
+          log(`${label}: ${formatBytes(effectiveBufferBytes)} allocated (no verify)  (total: ${formatBytes(totalAllocated())})`);
+        }
+
+        updateMetrics("probing...");
+        await nextFrame();
+        if (pauseMs > 0) await sleep(pauseMs);
+
+        // Push a dummy submit to flush and detect device loss early
+        try {
+          const enc = device.createCommandEncoder();
+          device.queue.submit([enc.finish()]);
+          await device.queue.onSubmittedWorkDone();
+        } catch (e) {
+          log(`GPU queue error after ${label}: ${e.message}`);
+          lastError = e;
+          break;
+        }
+      }
+
+      running = false;
+      $("startBtn").disabled = false;
+      $("stopBtn").disabled = true;
+
+      log(``);
+      log(`--- VRAM Probe Complete ---`);
+      log(`Buffers retained: ${bufferBank.length}`);
+      log(`Total VRAM allocated: ${formatBytes(totalAllocated())}`);
+      log(`Total VRAM verified by compute: ${formatBytes(verifiedBytes)}`);
+      if (lastError) {
+        log(`Stopped due to: ${lastError.message}`);
+        updateMetrics("limit reached");
+      } else if (stopRequested) {
+        log(`Stopped by user.`);
+        updateMetrics("stopped");
+      } else {
+        updateMetrics("target reached");
+      }
+      log(``);
+    }
+
+    function releaseAll() {
+      for (const buf of bufferBank) {
+        try { buf.destroy(); } catch (_) {}
+      }
+      const count = bufferBank.length;
+      bufferBank = [];
+      verifiedBytes = 0;
+      updateMetrics("released");
+      log(`Released ${count} GPU buffer(s). VRAM should be reclaimed by the driver.`);
+    }
+
+    // ─── Events ───
+    $("initBtn").addEventListener("click", () => {
+      initWebGPU().catch(e => {
+        log(`Init error: ${e.message}`);
+        $("gpuStatus").className = "status bad";
+        $("gpuStatus").textContent = `Init error: ${e.message}`;
+      });
+    });
+
+    $("startBtn").addEventListener("click", () => {
+      runProbe().catch(e => {
+        running = false;
+        $("startBtn").disabled = false;
+        $("stopBtn").disabled = true;
+        log(`Probe error: ${e.message}`);
+        updateMetrics("error");
+      });
+    });
+
+    $("stopBtn").addEventListener("click", () => {
+      stopRequested = true;
+      log("Stop requested...");
+    });
+
+    $("releaseBtn").addEventListener("click", releaseAll);
+
+    // ─── Startup check ───
+    if (!navigator.gpu) {
+      $("gpuStatus").className = "status bad";
+      $("gpuStatus").textContent = "WebGPU is NOT available.\nTry Chrome/Chromium 113+ or Edge 113+.\nCheck chrome://flags/#enable-unsafe-webgpu if needed.";
+    } else {
+      $("gpuStatus").className = "status warn";
+      $("gpuStatus").textContent = "WebGPU API detected. Click 'Init WebGPU' to request a GPU device.";
+    }
+
+    updateMetrics("waiting for init");
+  </script>
+</body>
+</html>
